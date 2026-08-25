@@ -1,0 +1,28 @@
+*.js
+!jest.config.js
+!scripts/*.js
+!admin-app/**/*.js
+!viewer-app/**/*.js
+# CloudFront Function sources are hand-written .js, not build output.
+!lib/cloudfront-functions/*.js
+*.d.ts
+node_modules
+
+# three.js is copied out of node_modules by scripts/vendor-three.js (postinstall).
+viewer-app/vendor/
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+
+# Local env / secrets
+.env
+cdk.context.json
+config.local.json
+cdk-outputs.json
+
+# OS / editor
+.DS_Store
+*.log
+
+private/

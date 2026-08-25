@@ -1,0 +1,38 @@
+{
+  "name": "threed-host-cdk",
+  "version": "0.1.0",
+  "description": "Serverless host for sharing 3D models (GLB) with per-project revisions and public feedback",
+  "bin": {
+    "threed-host": "bin/threed-host.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc -w",
+    "test": "jest",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "vendor": "node scripts/vendor-three.js",
+    "postinstall": "node scripts/vendor-three.js",
+    "dev": "node scripts/serve-local.js",
+    "sample-glb": "node scripts/make-sample-glb.js"
+  },
+  "devDependencies": {
+    "@aws-sdk/client-cloudfront": "^3.658.0",
+    "@aws-sdk/client-s3": "^3.658.0",
+    "@aws-sdk/s3-request-presigner": "^3.658.0",
+    "@types/aws-lambda": "^8.10.145",
+    "@types/jest": "^29.5.12",
+    "@types/node": "^20.14.0",
+    "aws-cdk": "^2.1128.1",
+    "esbuild": "^0.23.0",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "aws-cdk-lib": "^2.260.0",
+    "constructs": "^10.3.0",
+    "three": "^0.169.0"
+  }
+}

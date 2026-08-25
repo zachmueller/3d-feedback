@@ -1,0 +1,57 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Sign in · 3D models</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+  <div class="center">
+    <div class="card login-card">
+      <h1>3D models</h1>
+      <p class="subtitle">Publish models and read the feedback that comes back.</p>
+      <div id="status" class="status"></div>
+      <button id="signin" class="btn">Sign in with Google</button>
+      <p class="note" style="margin-top:16px">Access is restricted to approved accounts.</p>
+    </div>
+  </div>
+
+  <script type="module">
+    import { beginLogin, handleAuthCallback, getIdToken, el, setStatus } from '/app/app.js';
+
+    const statusNode = el('status');
+    const signinBtn = el('signin');
+
+    (async () => {
+      try {
+        // If we're returning from the Hosted UI with ?code=, finish the exchange.
+        const wasCallback = await handleAuthCallback();
+        if (wasCallback) {
+          window.location.assign('/admin');
+          return;
+        }
+        // Already signed in? Go straight to the admin list.
+        const token = await getIdToken();
+        if (token) {
+          window.location.assign('/admin');
+          return;
+        }
+      } catch (err) {
+        setStatus(statusNode, 'err', err.message || String(err));
+      }
+    })();
+
+    signinBtn.addEventListener('click', async () => {
+      signinBtn.disabled = true;
+      try {
+        await beginLogin();
+      } catch (err) {
+        signinBtn.disabled = false;
+        setStatus(statusNode, 'err', err.message || String(err));
+      }
+    });
+  </script>
+</body>
+</html>

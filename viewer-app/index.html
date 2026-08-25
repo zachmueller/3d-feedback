@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <!-- viewport-fit=cover + the safe-area insets in viewer.css keep the controls
+       clear of the iPhone home indicator and notch. -->
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <meta name="color-scheme" content="light dark" />
+  <title>3D model</title>
+  <!-- Inline so opening a share link never costs a request that 404s. -->
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath fill='%232b5cd9' d='M16 3 4 9v14l12 6 12-6V9z' opacity='.9'/%3E%3Cpath fill='%23fff' d='M16 3 4 9l12 6 12-6z' opacity='.35'/%3E%3C/svg%3E" />
+  <link rel="stylesheet" href="/viewer/viewer.css" />
+  <!-- Bare "three" is what the vendored examples modules import; the import map
+       points it at the self-hosted build. Supported by Safari 16.4+, Chrome 89+. -->
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/viewer/vendor/three.module.js",
+        "three/addons/": "/viewer/vendor/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="stage">
+    <canvas id="canvas"></canvas>
+
+    <div id="loading" class="overlay">
+      <div class="panel">
+        <span class="spinner"></span>
+        <span id="loadingText">Loading model…</span>
+      </div>
+    </div>
+
+    <div id="error" class="overlay hidden">
+      <div class="panel error">
+        <h1 id="errorTitle">Not found</h1>
+        <p id="errorText"></p>
+      </div>
+    </div>
+
+    <header id="topbar" class="hidden">
+      <div class="titles">
+        <h1 id="projectTitle"></h1>
+        <p id="revLine"></p>
+      </div>
+      <div class="toolbar">
+        <button id="partsToggle" class="btn small secondary" aria-expanded="false"
+                aria-controls="partsPanel">Parts</button>
+        <button id="resetView" class="btn small secondary" title="Reset the camera">Reset</button>
+      </div>
+    </header>
+
+    <nav id="revnav" class="hidden" aria-label="Revisions">
+      <!-- The words drop out on narrow screens (see .navword in viewer.css); the
+           aria-labels carry the meaning either way. -->
+      <button id="prevRev" class="btn small secondary" aria-label="Previous revision">‹<span class="navword"> Prev</span></button>
+      <select id="revSelect" aria-label="Choose a revision"></select>
+      <button id="nextRev" class="btn small secondary" aria-label="Next revision"><span class="navword">Next </span>›</button>
+    </nav>
+
+    <aside id="partsPanel" class="hidden" aria-label="Model parts">
+      <div class="parts-head">
+        <strong>Parts</strong>
+        <button id="partsAll" class="btn tiny secondary">Show all</button>
+      </div>
+      <ul id="partsList"></ul>
+    </aside>
+  </div>
+
+  <main id="below" class="hidden">
+    <section id="revInfo" class="card">
+      <h2>This revision</h2>
+      <p id="revNotes" class="notes"></p>
+      <p id="revMeta" class="meta"></p>
+    </section>
+
+    <section id="feedback" class="card">
+      <h2>Feedback <span id="commentCount" class="count"></span></h2>
+      <ul id="comments"></ul>
+      <p id="commentsEmpty" class="empty">No comments on this revision yet.</p>
+
+      <form id="commentForm" autocomplete="on">
+        <label for="commentName">Your name</label>
+        <input id="commentName" name="name" type="text" maxlength="60" placeholder="Name" />
+        <label for="commentText">Comment</label>
+        <textarea id="commentText" name="text" rows="4" maxlength="4000"
+                  placeholder="What should change?" required></textarea>
+        <div class="formrow">
+          <button id="commentSubmit" class="btn" type="submit">Post comment</button>
+          <span id="commentStatus" class="status"></span>
+        </div>
+      </form>
+    </section>
+  </main>
+
+  <script type="module" src="/viewer/viewer.js"></script>
+</body>
+</html>

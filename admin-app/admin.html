@@ -1,0 +1,222 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Projects · 3D models</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">3D models</div>
+    <nav>
+      <a href="#feedback">Feedback</a>
+      <a href="#" id="logout">Sign out</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="row">
+      <div>
+        <h1>Projects</h1>
+        <p class="subtitle">
+          Publish new revisions from the CLI with <code>tools/publish.sh</code>.
+          Every revision keeps its own link and its own feedback.
+        </p>
+      </div>
+      <div class="spacer"></div>
+      <button id="refresh" class="btn secondary small">Refresh</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div id="projects" class="stack"></div>
+    <div id="empty" class="empty hidden">
+      No projects yet. Publish one with <code>tools/publish.sh model.glb --project my-part</code>.
+    </div>
+    <div id="loading" class="empty"><span class="spinner"></span> Loading…</div>
+
+    <section id="feedback">
+      <div class="row">
+        <h2>Recent feedback</h2>
+        <div class="spacer"></div>
+        <button id="refreshFeedback" class="btn secondary small">Refresh</button>
+      </div>
+      <div id="feedbackList" class="stack"></div>
+      <div id="feedbackEmpty" class="empty hidden">No feedback yet.</div>
+    </section>
+  </main>
+
+  <script type="module">
+    import {
+      requireAuth, api, getConfig, shareUrl, logout,
+      el, setStatus, copyText, escapeHtml, fmtDate,
+    } from '/app/app.js';
+
+    const projectsNode = el('projects');
+    const statusNode = el('status');
+    const emptyNode = el('empty');
+    const loadingNode = el('loading');
+    const feedbackNode = el('feedbackList');
+    const feedbackEmpty = el('feedbackEmpty');
+
+    let cfg;
+
+    el('logout').addEventListener('click', (e) => { e.preventDefault(); logout(); });
+    el('refresh').addEventListener('click', () => loadProjects());
+    el('refreshFeedback').addEventListener('click', () => loadFeedback());
+
+    function fmtBytes(n) {
+      if (!n) return '';
+      return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
+    }
+
+    function statusPill(rev) {
+      if (rev.status === 'ready') return '';
+      const kind = rev.status === 'error' ? 'err' : 'warn';
+      const title = rev.error ? ` title="${escapeHtml(rev.error)}"` : '';
+      return ` <span class="pill ${kind}"${title}>${escapeHtml(rev.status)}</span>`;
+    }
+
+    function revisionRow(project, rev) {
+      const url = shareUrl(cfg, project.slug, rev.rev);
+      // A revision that never finished processing has no page to link to.
+      const link = rev.status === 'ready'
+        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="mono">/${escapeHtml(project.slug)}/${rev.rev}</a>`
+        : `<span class="mono muted">/${escapeHtml(project.slug)}/${rev.rev}</span>`;
+      const comments = rev.commentCount
+        ? `<span class="pill">${rev.commentCount} comment${rev.commentCount === 1 ? '' : 's'}</span>`
+        : '';
+      return `<li>
+        <div class="revhead">
+          <strong>Rev ${rev.rev}</strong>${statusPill(rev)}
+          ${link}
+          <span class="spacer"></span>
+          ${comments}
+          <button class="btn tiny secondary" data-act="copy" data-url="${escapeHtml(url)}">Copy</button>
+          <button class="btn tiny secondary" data-act="notes" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Notes</button>
+          <button class="btn tiny danger" data-act="del-rev" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Delete</button>
+        </div>
+        <div class="note">${escapeHtml(rev.notes || 'No notes.')}</div>
+        <div class="meta mono">${escapeHtml(fmtDate(rev.publishedAt || rev.reservedAt))} · ${escapeHtml(fmtBytes(rev.bytes))}</div>
+      </li>`;
+    }
+
+    function projectCard(project) {
+      const latestUrl = shareUrl(cfg, project.slug);
+      const count = project.revisions.length;
+      return `<div class="card">
+        <div class="row">
+          <div>
+            <div class="title">${escapeHtml(project.title || project.slug)}</div>
+            <div class="meta mono">${escapeHtml(project.slug)} · ${count} revision${count === 1 ? '' : 's'}${
+              project.latest ? ` · latest is rev ${project.latest}` : ' · nothing published'
+            }</div>
+          </div>
+          <div class="spacer"></div>
+          <a class="btn tiny secondary" href="${escapeHtml(latestUrl)}" target="_blank" rel="noopener">Open latest</a>
+          <button class="btn tiny secondary" data-act="copy" data-url="${escapeHtml(latestUrl)}">Copy</button>
+          <button class="btn tiny secondary" data-act="title" data-slug="${escapeHtml(project.slug)}">Rename</button>
+          <button class="btn tiny danger" data-act="del-project" data-slug="${escapeHtml(project.slug)}">Delete all</button>
+        </div>
+        <details${count <= 3 ? ' open' : ''}>
+          <summary>${count} revision${count === 1 ? '' : 's'}</summary>
+          <ul class="revs">${project.revisions.map((r) => revisionRow(project, r)).join('')}</ul>
+        </details>
+      </div>`;
+    }
+
+    async function loadProjects() {
+      loadingNode.classList.remove('hidden');
+      try {
+        const { projects } = await api('list');
+        loadingNode.classList.add('hidden');
+        projectsNode.innerHTML = projects.map(projectCard).join('');
+        emptyNode.classList.toggle('hidden', projects.length > 0);
+      } catch (err) {
+        loadingNode.classList.add('hidden');
+        setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
+      }
+    }
+
+    async function loadFeedback() {
+      try {
+        const { items } = await api('feedback');
+        feedbackNode.innerHTML = items.map((c) => `
+          <div class="card comment">
+            <div class="revhead">
+              <strong>${escapeHtml(c.name || 'Anonymous')}</strong>
+              <span class="meta">${escapeHtml(fmtDate(c.at))}</span>
+              <span class="spacer"></span>
+              <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="mono">/${escapeHtml(c.project)}/${c.revision}</a>
+            </div>
+            <div class="ctext">${escapeHtml(c.text)}</div>
+          </div>`).join('');
+        feedbackEmpty.classList.toggle('hidden', items.length > 0);
+      } catch (err) {
+        setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
+      }
+    }
+
+    // One delegated handler for every button in both lists.
+    document.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-act]');
+      if (!button) return;
+      const { act, slug, rev, url } = button.dataset;
+
+      try {
+        if (act === 'copy') {
+          const ok = await copyText(url);
+          const original = button.textContent;
+          button.textContent = ok ? 'Copied!' : 'Copy failed';
+          setTimeout(() => { button.textContent = original; }, 1500);
+          return;
+        }
+        if (act === 'title') {
+          const title = prompt(`Title for "${slug}"`);
+          if (title === null) return;
+          await api('edit', { project: slug, title });
+          await loadProjects();
+          return;
+        }
+        if (act === 'notes') {
+          const notes = prompt(`Notes for ${slug} rev ${rev}`);
+          if (notes === null) return;
+          await api('edit', { project: slug, revision: Number(rev), notes });
+          await loadProjects();
+          return;
+        }
+        if (act === 'del-rev') {
+          if (!confirm(`Delete ${slug} rev ${rev}? Its link and feedback go away for good.`)) return;
+          await api('delete', { project: slug, revision: Number(rev) });
+          setStatus(statusNode, 'ok', `Deleted ${escapeHtml(slug)} rev ${escapeHtml(rev)}.`);
+          await loadProjects();
+          return;
+        }
+        if (act === 'del-project') {
+          if (!confirm(`Delete the whole "${slug}" project — every revision and all feedback?`)) return;
+          await api('delete', { project: slug });
+          setStatus(statusNode, 'ok', `Deleted ${escapeHtml(slug)}.`);
+          await Promise.all([loadProjects(), loadFeedback()]);
+          return;
+        }
+      } catch (err) {
+        setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
+      }
+    });
+
+    (async () => {
+      await requireAuth();
+      cfg = await getConfig();
+      await Promise.all([loadProjects(), loadFeedback()]);
+    })().catch((err) => {
+      // requireAuth rejects on purpose after starting the redirect to /login;
+      // swallowing it here keeps that from surfacing as an uncaught error.
+      if (err?.message !== 'redirecting to login') {
+        setStatus(statusNode, 'err', escapeHtml(err?.message || String(err)));
+      }
+    });
+  </script>
+</body>
+</html>

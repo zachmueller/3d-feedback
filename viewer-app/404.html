@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Not found</title>
+  <link rel="stylesheet" href="/viewer/viewer.css" />
+  <style>
+    /* This page is also what CloudFront returns for a missing JSON object, so it
+       stays self-contained and tiny rather than booting the viewer. */
+    body { display: grid; place-items: center; min-height: 100dvh; padding: 24px; }
+    .box { max-width: 420px; text-align: center; }
+    h1 { font-size: 18px; margin: 0 0 8px; }
+    p { color: var(--muted); margin: 0; }
+  </style>
+</head>
+<body>
+  <div class="box card">
+    <h1>Not found</h1>
+    <p>There is nothing at this address. If you were sent a model link, check it
+      for a missing character — or ask for a fresh one.</p>
+  </div>
+</body>
+</html>
