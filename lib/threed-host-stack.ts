@@ -402,7 +402,7 @@ export class ThreedHostStack extends Stack {
     // Publishing is automation-first: SigV4 with the deployer's own AWS
     // credentials, so a Notor workflow needs no OAuth dance. Cognito stays for
     // the human admin app only.
-    httpApi.addRoutes({
+    const publishRoutes = httpApi.addRoutes({
       path: '/publish',
       methods: [apigwv2.HttpMethod.POST],
       integration,
@@ -410,18 +410,18 @@ export class ThreedHostStack extends Stack {
     });
 
     // Admin actions — Google sign-in + email allowlist (re-checked in the handler).
-    for (const action of ['list', 'edit', 'delete', 'feedback']) {
+    const adminRoutes = ['list', 'edit', 'delete', 'feedback'].flatMap((action) =>
       httpApi.addRoutes({
         path: `/${action}`,
         methods: [apigwv2.HttpMethod.POST],
         integration,
         authorizer: jwtAuthorizer,
-      });
-    }
+      }),
+    );
 
     // Public: anyone with a share link can leave feedback without signing in.
     // Guarded by route throttling below plus strict caps in the handler.
-    httpApi.addRoutes({
+    const commentRoutes = httpApi.addRoutes({
       path: '/comment',
       methods: [apigwv2.HttpMethod.POST],
       integration,
@@ -435,6 +435,15 @@ export class ThreedHostStack extends Stack {
     stage.addPropertyOverride('RouteSettings', {
       'POST /comment': { ThrottlingRateLimit: 5, ThrottlingBurstLimit: 10 },
     });
+    // API Gateway validates each RouteSettings key against the API's existing
+    // routes, and nothing in the template otherwise orders the stage after the
+    // routes — CloudFormation creates them in parallel and the stage loses the
+    // race ("Unable to find Route by key POST /comment"). Only the keyed route
+    // needs to exist first, but depending on all of them is cheap and keeps this
+    // correct if another route is given settings later.
+    for (const route of [...publishRoutes, ...adminRoutes, ...commentRoutes]) {
+      stage.node.addDependency(route);
+    }
 
     const apiUrl = httpApi.apiEndpoint;
 

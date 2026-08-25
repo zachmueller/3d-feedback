@@ -175,6 +175,18 @@ describe('HTTP API authorization', () => {
     });
   });
 
+  // API Gateway rejects RouteSettings naming a route that does not exist yet, so
+  // the stage has to be ordered after the routes rather than created alongside
+  // them. Losing this DependsOn only shows up as a failed deploy.
+  it('creates the stage after the routes its settings name', () => {
+    const stages = template.findResources('AWS::ApiGatewayV2::Stage');
+    const [stage] = Object.values(stages);
+    const routeIds = Object.keys(template.findResources('AWS::ApiGatewayV2::Route'));
+
+    expect(routeIds.length).toBeGreaterThan(0);
+    expect(stage.DependsOn ?? []).toEqual(expect.arrayContaining(routeIds));
+  });
+
   it('points every route at the one handler', () => {
     template.resourceCountIs('AWS::ApiGatewayV2::Integration', 1);
   });
