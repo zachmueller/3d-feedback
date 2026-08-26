@@ -13,7 +13,13 @@ viewer-app/vendor/
 
 # CDK asset staging directory
 .cdk.staging
+
+# freecad_selftest.py imports the exporter, which leaves bytecode behind.
+__pycache__/
 cdk.out
+
+# The manual-setup checklist is a working document with account details in it.
+MANUAL-SETUP.md
 
 # Local env / secrets
 .env

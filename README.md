@@ -120,14 +120,34 @@ export_glb('/tmp/towel-clip.glb')
 ```
 
 or headless: `freecadcmd tools/freecad_export_glb.py -- out.glb --fcstd part.FCStd`
+(FreeCAD also tries to open `out.glb` as a document and prints an exception about
+it — harmless).
 
 It exports every visible top-level object that has faces, skipping things already
-carried by a parent container. **Object labels become the node names in the
+carried by a parent container and skipping datum/origin geometry, which is a
+construction aid rather than a part. **Object labels become the node names in the
 `.glb`, and those are exactly what the viewer's parts panel lists** — so renaming
 a body in the model tree renames its checkbox.
 
+Label a body `ref_Something` for geometry that is context rather than a part — the
+glass panel, the cabinet door, the wall it screws to. It is still exported, but the
+viewer lists it as "Something (reference)" with the checkbox off.
+
 If curves look faceted, tighten the tessellation:
-`export_glb(path, linear_deflection=0.05, angular_deflection=0.2)`.
+`export_glb(path, linear_deflection=0.05)`. The value is FreeCAD's
+`ViewObject.Deviation` — a percentage of the object's size, default 0.5, lower is
+finer — and `angular_deflection` is `ViewObject.AngularDeflection` in **degrees**
+(default 28.5). Expect the file to grow: 0.5 → 0.01 was 2.2× the bytes on a
+13-body assembly, which matters on a phone. The export prints the values it
+actually applied, so "nothing changed" is visible rather than silent.
+
+Console mode (`freecadcmd`) has no view provider, so it triangulates the shapes
+itself at the equivalent quality and exports without per-face colours.
+
+`npm run test:freecad` runs [tools/freecad_selftest.py](tools/freecad_selftest.py)
+against a document built in memory — nesting, origin planes, a hidden body, a
+`PartDesign` datum and a `Base Plate.v2` label. It needs FreeCAD installed
+(`FREECADCMD=` overrides the path) and is kept out of `npm test` for that reason.
 
 Only `.glb` (glTF 2.0 binary) is accepted; the processor checks the magic bytes
 and rejects `.gltf`, `.stl` and `.step` with a message saying so.
@@ -141,8 +161,10 @@ npm run dev          # http://localhost:8080/sample/1
 
 The dev server stands in for CloudFront, S3 and the API, and it routes URLs by
 executing the **real** `lib/cloudfront-functions/*.js`, so a routing change is
-exercised locally before it is deployed. It serves a two-part sample model from
-`scripts/make-sample-glb.js`, and `POST /comment` appends to an in-memory thread.
+exercised locally before it is deployed. It serves a three-part sample model from
+`scripts/make-sample-glb.js` — one part is `ref_Wall Panel`, so the
+reference-geometry behaviour is visible without FreeCAD — and `POST /comment`
+appends to an in-memory thread.
 
 three.js is self-hosted rather than loaded from a CDN, so a shared link has no
 third-party dependency at view time. `scripts/vendor-three.js` (run on
@@ -156,6 +178,7 @@ version comes from `package.json`.
 npm install
 npm run build      # tsc
 npm test           # jest: stack assertions, handler units, edge functions
+npm run test:freecad  # exporter selection rules (needs FreeCAD installed)
 npm run dev        # local preview server
 npm run vendor     # re-copy three.js after changing its version
 npx cdk synth
@@ -224,6 +247,7 @@ until the parent delegates, so the domain is switched on in a second pass.
 | `tools/publish.sh` | Publish a revision, print the share URL |
 | `tools/delegate-ns.sh` | One-time NS delegation into the parent zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
+| `tools/freecad_selftest.py` | Exporter selection rules, against a fixture document |
 | `scripts/` | three.js vendoring, sample model, dev server |
 | `test/` | Stack assertions + handler and edge-function units |
 

@@ -9,6 +9,7 @@
     "build": "tsc",
     "watch": "tsc -w",
     "test": "jest",
+    "test:freecad": "\"${FREECADCMD:-$(command -v freecadcmd || echo /Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd)}\" tools/freecad_selftest.py",
     "cdk": "cdk",
     "synth": "cdk synth",
     "vendor": "node scripts/vendor-three.js",

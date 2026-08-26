@@ -241,6 +241,16 @@ function nameResolver(gltf) {
   };
 }
 
+/**
+ * Reference geometry: the thing a part mounts to, not the part itself.
+ *
+ * Assemblies routinely carry a body for context — a shower panel, a cabinet door,
+ * a hook back plate — and nothing in a glTF distinguishes it from printed
+ * geometry. The exporter's convention is a `ref_` label prefix, so a reviewer sees
+ * the printed parts first and can switch the context back on.
+ */
+const REFERENCE_PREFIX = /^ref[\s_-]+/i;
+
 function buildPartsPanel(gltf) {
   const root = gltf.scene;
   const displayName = nameResolver(gltf);
@@ -259,10 +269,16 @@ function buildPartsPanel(gltf) {
     const id = `part-${i}`;
     const li = document.createElement('li');
 
+    const raw = displayName(node) || `Part ${i + 1}`;
+    const isReference = REFERENCE_PREFIX.test(raw);
+    // Framing already happened and Box3 ignores `visible`, so starting a reference
+    // part hidden does not move the camera.
+    if (isReference) node.visible = false;
+
     const input = document.createElement('input');
     input.type = 'checkbox';
     input.id = id;
-    input.checked = true;
+    input.checked = !isReference;
     input.addEventListener('change', () => {
       node.visible = input.checked;
       requestRender();
@@ -271,7 +287,7 @@ function buildPartsPanel(gltf) {
     const label = document.createElement('label');
     label.setAttribute('for', id);
     // Labels come from the model, so set text rather than markup.
-    const name = displayName(node) || `Part ${i + 1}`;
+    const name = isReference ? `${raw.replace(REFERENCE_PREFIX, '')} (reference)` : raw;
     label.textContent = name;
     label.title = name; // the panel truncates long labels
 

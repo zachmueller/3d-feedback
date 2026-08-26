@@ -1,11 +1,13 @@
 #!/usr/bin/env node
 /**
- * Write a small two-part .glb for smoke-testing the viewer and the publish path.
+ * Write a small three-part .glb for smoke-testing the viewer and the publish path.
  *
  *   node scripts/make-sample-glb.js [out.glb]
  *
- * The two nodes are named, because those names are what the viewer's parts panel
- * lists — a single-mesh file would not exercise it. Geometry is deliberately
+ * The nodes are named, because those names are what the viewer's parts panel
+ * lists — a single-mesh file would not exercise it. One of them is `ref_Wall Panel`,
+ * which exercises the reference-geometry convention: the viewer lists it as
+ * "Wall Panel (reference)" with its checkbox off. Geometry is deliberately
  * hand-built (no exporter dependency) and sized in millimetres, matching what
  * FreeCAD produces, so the camera-framing code gets a realistic scale.
  */
@@ -39,21 +41,25 @@ const binary = Buffer.concat([
 ]);
 
 // --- glTF JSON -------------------------------------------------------------
-// Two nodes share one mesh geometry but use different materials and transforms,
+// The nodes share one mesh geometry but use different materials and transforms,
 // which is the shape a small FreeCAD assembly arrives in.
 const gltf = {
   asset: { version: '2.0', generator: '3d-feedback make-sample-glb' },
   scene: 0,
-  scenes: [{ nodes: [0, 1] }],
+  scenes: [{ nodes: [0, 1, 2] }],
   nodes: [
     // 30 mm base plate.
     { name: 'Base Plate', mesh: 0, scale: [30, 4, 30] },
     // 24 mm arm standing on it, offset so the two are distinguishable.
     { name: 'Clip Arm', mesh: 1, translation: [4, 4, 4], scale: [6, 24, 6] },
+    // Not a printed part: the wall the clip screws into. The `ref_` prefix is what
+    // tells the viewer to list it as context and start it hidden.
+    { name: 'ref_Wall Panel', mesh: 2, translation: [-5, 0, -3], scale: [40, 60, 2] },
   ],
   meshes: [
     { name: 'Base Plate', primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 0 }] },
     { name: 'Clip Arm', primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 1 }] },
+    { name: 'ref_Wall Panel', primitives: [{ attributes: { POSITION: 0 }, indices: 1, material: 2 }] },
   ],
   materials: [
     {
@@ -63,6 +69,10 @@ const gltf = {
     {
       name: 'Plastic',
       pbrMetallicRoughness: { baseColorFactor: [0.15, 0.42, 0.85, 1], metallicFactor: 0, roughnessFactor: 0.6 },
+    },
+    {
+      name: 'Reference',
+      pbrMetallicRoughness: { baseColorFactor: [0.82, 0.83, 0.85, 1], metallicFactor: 0, roughnessFactor: 0.85 },
     },
   ],
   accessors: [
@@ -107,4 +117,7 @@ header.writeUInt32LE(2, 4);
 header.writeUInt32LE(12 + body.length, 8);
 
 fs.writeFileSync(out, Buffer.concat([header, body]));
-console.log(`wrote ${out} (${fs.statSync(out).size} bytes, 2 named parts)`);
+console.log(
+  `wrote ${out} (${fs.statSync(out).size} bytes, ${gltf.nodes.length} named parts, ` +
+    `one of them reference geometry)`,
+);

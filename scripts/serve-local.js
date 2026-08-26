@@ -10,7 +10,8 @@
  *  - URL routing runs the REAL lib/cloudfront-functions/*.js through the same
  *    contract CloudFront uses, so a routing change is exercised here first.
  *  - /projects, /comments and /status are served from an in-memory fixture
- *    seeded with a two-part sample model (scripts/make-sample-glb.js).
+ *    seeded with a three-part sample model (scripts/make-sample-glb.js), one part
+ *    of which is reference geometry.
  *  - POST /comment appends to the in-memory thread, like the real handler.
  *
  * The admin app is served too, but its Cognito sign-in cannot work locally.
@@ -34,11 +35,12 @@ const adminRewrite = loadFunction('admin-rewrite.js');
 
 // --- fixture data ------------------------------------------------------------
 const samplePath = path.join(require('os').tmpdir(), '3d-feedback-sample.glb');
-if (!fs.existsSync(samplePath)) {
-  execFileSync(process.execPath, [path.join(__dirname, 'make-sample-glb.js'), samplePath], {
-    stdio: 'inherit',
-  });
-}
+// Rebuilt on every start rather than cached: it takes milliseconds, and a sample
+// left over from an earlier version of make-sample-glb.js would quietly serve the
+// wrong parts list.
+execFileSync(process.execPath, [path.join(__dirname, 'make-sample-glb.js'), samplePath], {
+  stdio: 'inherit',
+});
 
 const publishedAt = new Date('2026-08-20T10:00:00Z').toISOString();
 const fixtures = {
