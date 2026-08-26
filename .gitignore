@@ -26,6 +26,8 @@ MANUAL-SETUP.md
 cdk.context.json
 config.local.json
 cdk-outputs.json
+# MCP server settings for this machine; config.example.json is the committed one.
+tools/mcp/config.json
 
 # OS / editor
 .DS_Store

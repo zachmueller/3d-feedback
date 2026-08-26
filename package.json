@@ -15,7 +15,10 @@
     "vendor": "node scripts/vendor-three.js",
     "postinstall": "node scripts/vendor-three.js",
     "dev": "node scripts/serve-local.js",
-    "sample-glb": "node scripts/make-sample-glb.js"
+    "sample-glb": "node scripts/make-sample-glb.js",
+    "mcp": "ts-node --prefer-ts-exts --project tools/mcp/tsconfig.json tools/mcp/server.ts",
+    "mcp:check": "tsc -p tools/mcp/tsconfig.json",
+    "mcp:smoke": "node scripts/mcp-smoke.js"
   },
   "devDependencies": {
     "@aws-sdk/client-cloudfront": "^3.658.0",
@@ -32,8 +35,10 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "aws-cdk-lib": "^2.260.0",
     "constructs": "^10.3.0",
-    "three": "^0.169.0"
+    "three": "^0.169.0",
+    "zod": "^3.25.76"
   }
 }

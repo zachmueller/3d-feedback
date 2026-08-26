@@ -4,7 +4,8 @@
 #
 #   tools/publish.sh model.glb --project towel-clip \
 #       [--title "Towel clip"] [--notes "raised the clip angle 5°"] \
-#       [--profile my-aws-profile] [--api-url https://…] [--quiet]
+#       [--profile my-aws-profile] [--api-url https://…] [--quiet] \
+#       [--timeout 120]
 #
 # The URL is printed on stdout as the last line and nothing else goes there, so a
 # workflow can capture it directly:
@@ -13,7 +14,7 @@
 #
 # Steps: SigV4-signed POST /publish reserves the revision and returns a presigned
 # PUT; the file goes straight to S3; then status/<project>/<rev>.json is polled
-# until the processor marks it ready.
+# until the processor marks it ready, or --timeout seconds pass (default 120).
 set -euo pipefail
 
 die() { echo "error: $*" >&2; exit 1; }
@@ -28,6 +29,9 @@ API_URL="${THREED_API_URL:-}"
 SITE_URL="${THREED_SITE_URL:-}"
 REGION="${AWS_REGION:-us-east-1}"
 QUIET=""
+# How long to wait for the processor. Two minutes matches the Lambda's own
+# timeout, so the default gives up at the same moment the work would have.
+TIMEOUT=120
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -38,8 +42,9 @@ while [[ $# -gt 0 ]]; do
     --api-url) API_URL="${2:-}"; shift 2 ;;
     --site-url) SITE_URL="${2:-}"; shift 2 ;;
     --region)  REGION="${2:-}";  shift 2 ;;
+    --timeout) TIMEOUT="${2:-}"; shift 2 ;;
     --quiet|-q) QUIET=1; shift ;;
-    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,17p' "$0"; exit 0 ;;
     -*) die "unknown flag $1" ;;
     *) [[ -z "$FILE" ]] || die "only one file at a time"; FILE="$1"; shift ;;
   esac
@@ -48,6 +53,7 @@ done
 [[ -n "$FILE" ]] || die "pass the .glb file to publish"
 [[ -f "$FILE" ]] || die "no such file: $FILE"
 [[ -n "$PROJECT" ]] || die "--project is required"
+[[ "$TIMEOUT" =~ ^[0-9]+$ && "$TIMEOUT" -gt 0 ]] || die "--timeout must be a positive number of seconds"
 
 command -v jq >/dev/null || die "jq is required (brew install jq)"
 command -v aws >/dev/null || die "the AWS CLI v2 is required"
@@ -118,7 +124,7 @@ UPLOAD_STATUS=$(curl -sS -o /dev/null -w '%{http_code}' -X PUT --upload-file "$F
 # 3. Wait for the processor.
 log "waiting for processing…"
 STATUS_URL="$SITE_URL/status/$PROJECT/$REVISION.json"
-DEADLINE=$(( $(date +%s) + 120 ))
+DEADLINE=$(( $(date +%s) + TIMEOUT ))
 while :; do
   sleep 2
   BODY=$(curl -sS -H 'cache-control: no-cache' "$STATUS_URL" 2>/dev/null || true)

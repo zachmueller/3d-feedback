@@ -1,0 +1,17 @@
+{
+  // The MCP SDK ships its entry points through package.json "exports" subpaths
+  // (`@modelcontextprotocol/sdk/server/mcp.js`), which TypeScript only resolves
+  // under node16 resolution — the root tsconfig's implicit node10 cannot see
+  // them. Everything else is inherited, and the emit format is still CommonJS
+  // because package.json has no "type": "module".
+  //
+  // noEmit, because the server runs from source via ts-node (see the `mcp`
+  // script in package.json); this project exists to type-check it.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "module": "node16",
+    "moduleResolution": "node16",
+    "noEmit": true
+  },
+  "include": ["**/*.ts", "../../lib/lambda/handler.ts"]
+}

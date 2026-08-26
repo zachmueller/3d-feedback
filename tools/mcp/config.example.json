@@ -1,0 +1,51 @@
+{
+  "_readme": [
+    "Optional config file for the MCP server. Copy to tools/mcp/config.json (gitignored),",
+    "or point THREED_CONFIG at it. Every key here also has a THREED_* environment variable,",
+    "which wins over this file — see the README's MCP table. Keys are checked on startup, so",
+    "a typo stops the server with a message rather than being ignored. Delete what you do not",
+    "need; the values below are the defaults.",
+    "No credentials belong in this file: publishing shells out to tools/publish.sh, which",
+    "resolves them from the named profile with `aws configure export-credentials`."
+  ],
+
+  "_readme_aws": "Which profile signs POST /publish. Unset means the default credential chain.",
+  "awsProfile": "random",
+  "awsRegion": "us-east-1",
+
+  "_readme_endpoints": "Unset means: read ApiUrl/SiteUrl out of cdk-outputs.json.",
+  "apiUrl": null,
+  "siteUrl": null,
+  "outputsFile": null,
+
+  "_readme_freecad": "freecadcmd is not on PATH in a default macOS install.",
+  "freecadcmd": "/Applications/FreeCAD.app/Contents/Resources/bin/freecadcmd",
+  "exportScript": null,
+  "publishScript": null,
+  "workDir": null,
+
+  "_readme_defaults": "Applied when a tool call omits the argument.",
+  "defaultProject": null,
+  "defaultLinearDeflection": null,
+  "defaultAngularDeflection": null,
+
+  "_readme_limits": "maxModelBytes mirrors the Lambda's cap; warnModelBytes is only advisory.",
+  "freecadTimeoutSeconds": 300,
+  "publishTimeoutSeconds": 120,
+  "maxModelBytes": 104857600,
+  "warnModelBytes": 26214400,
+
+  "_readme_guardrails": [
+    "allowedPaths: [] lets the server read any path its user can. Set it to confine a harness.",
+    "allowPublish: false unregisters publish_model and convert_and_publish entirely.",
+    "dryRun: true exports and inspects for real but reports the publish command instead of running it.",
+    "enabledTools: [] means all of them."
+  ],
+  "allowedPaths": [],
+  "allowPublish": true,
+  "dryRun": false,
+  "enabledTools": [],
+
+  "logLevel": "info",
+  "logFile": null
+}

@@ -142,7 +142,10 @@ finer — and `angular_deflection` is `ViewObject.AngularDeflection` in **degree
 actually applied, so "nothing changed" is visible rather than silent.
 
 Console mode (`freecadcmd`) has no view provider, so it triangulates the shapes
-itself at the equivalent quality and exports without per-face colours.
+itself at the equivalent quality and exports without per-face colours. That is
+also why the MCP server below has two export tools: `export_glb` runs this
+headless path unattended, while `gui_export_instructions` hands back the snippet
+above for a harness that can drive an open FreeCAD and wants the colours.
 
 `npm run test:freecad` runs [tools/freecad_selftest.py](tools/freecad_selftest.py)
 against a document built in memory — nesting, origin planes, a hidden body, a
@@ -151,6 +154,102 @@ against a document built in memory — nesting, origin planes, a hidden body, a
 
 Only `.glb` (glTF 2.0 binary) is accepted; the processor checks the magic bytes
 and rejects `.gltf`, `.stl` and `.step` with a message saying so.
+
+## MCP server
+
+[tools/mcp/](tools/mcp/) is a stdio MCP server that hands the whole path —
+FreeCAD document → `.glb` → revision URL — to another AI harness, so it does not
+have to rediscover the parts that are not guessable: that `freecadcmd` is not on
+PATH, that the exporter needs a `--` separator, that only `.glb` is accepted, what
+`ref_` means, which AWS profile signs the publish, or that revision numbers are
+burned permanently even by a throwaway publish.
+
+```bash
+npm run mcp          # run it (stdio; a harness normally spawns this)
+npm run mcp:smoke    # handshake + check_setup + inspect_glb over real stdio
+npm run mcp:check    # typecheck
+```
+
+Register it by pointing the harness at the same command:
+
+```json
+{
+  "command": "npx",
+  "args": ["ts-node", "--prefer-ts-exts", "--project",
+           "/Volumes/workplace/3d-feedback/tools/mcp/tsconfig.json",
+           "/Volumes/workplace/3d-feedback/tools/mcp/server.ts"],
+  "env": {
+    "THREED_AWS_PROFILE": "random",
+    "THREED_DEFAULT_PROJECT": "towel-clip"
+  }
+}
+```
+
+Six tools:
+
+| Tool | Does |
+|---|---|
+| `check_setup` | Effective config (and which layer each value came from) plus a read-only health check: FreeCAD binary, `aws`/`jq`/`curl --aws-sigv4`, resolved endpoints, and whether the profile has live credentials **for the deployment's own account** — it compares `sts get-caller-identity` against the account in the `PublishRouteArn` output, because an ambient `AWS_PROFILE` pointing elsewhere otherwise shows up only as an opaque 403. Names the fix for each failure. |
+| `export_glb` | Headless `freecadcmd` export of a **saved** `.FCStd`, then reports the parts panel it produced |
+| `gui_export_instructions` | The `exec()` snippet to run in an already-open FreeCAD (freecad-mcp), which keeps per-face colours and exports the live document |
+| `inspect_glb` | Local check: parts-panel prediction, `ref_` parts, triangle counts, would the processor accept it |
+| `publish_model` | Publish an existing `.glb` as the next revision; returns the share URL |
+| `convert_and_publish` | Export → inspect → publish in one call |
+
+Editing and deleting are deliberately absent: those routes are Cognito-only
+(`/admin`), and a headless server cannot complete a Google sign-in. Publishing
+works because `POST /publish` is SigV4 — see the auth table above.
+
+The parts prediction in `inspect_glb` mirrors `viewer-app/viewer.js`, so it
+answers "will the reviewer see the checkboxes I expect?" without a publish.
+[test/mcp-glb.test.ts](test/mcp-glb.test.ts) pins the pair against the same sample
+model the dev server uses, because two implementations of one rule drift.
+
+### Configuration
+
+Every knob has a `THREED_*` variable, because a harness's MCP `env` block is the
+only configuration surface it offers. The long tail can go in a gitignored
+`tools/mcp/config.json` instead ([config.example.json](tools/mcp/config.example.json)
+lists them all). Precedence, reported per key by `check_setup`:
+
+**per-call argument → `THREED_*` env → config file → `cdk-outputs.json` → default**
+
+| Variable | File key | Default |
+|---|---|---|
+| `THREED_AWS_PROFILE` | `awsProfile` | `$AWS_PROFILE` |
+| `THREED_AWS_REGION` | `awsRegion` | `$AWS_REGION`, else `us-east-1` |
+| `THREED_API_URL` | `apiUrl` | `ApiUrl` from the outputs file |
+| `THREED_SITE_URL` | `siteUrl` | `SiteUrl` from the outputs file |
+| `THREED_OUTPUTS_FILE` | `outputsFile` | `cdk-outputs.json` |
+| `THREED_CONFIG` | — | `tools/mcp/config.json` |
+| `THREED_REPO_ROOT` | — | resolved from the server's own path |
+| `THREED_PUBLISH_SCRIPT` | `publishScript` | `tools/publish.sh` |
+| `THREED_EXPORT_SCRIPT` | `exportScript` | `tools/freecad_export_glb.py` |
+| `THREED_FREECADCMD` | `freecadcmd` | PATH, then `/Applications/FreeCAD.app/…/freecadcmd` |
+| `THREED_WORK_DIR` | `workDir` | `$TMPDIR/3d-feedback` |
+| `THREED_DEFAULT_PROJECT` | `defaultProject` | none (then `project` is required) |
+| `THREED_DEFAULT_LINEAR_DEFLECTION` | `defaultLinearDeflection` | FreeCAD's 0.5 |
+| `THREED_DEFAULT_ANGULAR_DEFLECTION` | `defaultAngularDeflection` | FreeCAD's 28.5 |
+| `THREED_FREECAD_TIMEOUT_SECONDS` | `freecadTimeoutSeconds` | 300 |
+| `THREED_PUBLISH_TIMEOUT_SECONDS` | `publishTimeoutSeconds` | 120 |
+| `THREED_MAX_MODEL_BYTES` | `maxModelBytes` | 100 MB (the Lambda's own cap) |
+| `THREED_WARN_MODEL_BYTES` | `warnModelBytes` | 25 MB (advisory) |
+| `THREED_ALLOWED_PATHS` | `allowedPaths` | anywhere; `:`-separated roots confine it |
+| `THREED_ALLOW_PUBLISH` | `allowPublish` | `true`; `false` unregisters the publishing tools |
+| `THREED_DRY_RUN` | `dryRun` | `false`; exports for real, reports the publish command instead of running it |
+| `THREED_ENABLED_TOOLS` | `enabledTools` | all; a comma list narrows the surface |
+| `THREED_LOG_LEVEL` | `logLevel` | `info` (stderr) |
+| `THREED_LOG_FILE` | `logFile` | none |
+
+No credentials are configured here, only a profile *name*: publishing shells out
+to `publish.sh`, which resolves them with `aws configure export-credentials`. An
+unknown key or an unparseable value stops the server with a message rather than
+being silently ignored — the exception is `cdk-outputs.json`, which is tolerated
+when broken (the export tools do not need it) and reported by `check_setup`.
+
+Because stdout carries JSON-RPC, every child process is captured rather than
+inherited and all logging goes to stderr; `npm run mcp:smoke` fails if anything
+else reaches stdout.
 
 ## Local development
 
@@ -177,10 +276,13 @@ version comes from `package.json`.
 ```bash
 npm install
 npm run build      # tsc
-npm test           # jest: stack assertions, handler units, edge functions
+npm test           # jest: stack assertions, handler units, edge functions, MCP units
 npm run test:freecad  # exporter selection rules (needs FreeCAD installed)
 npm run dev        # local preview server
 npm run vendor     # re-copy three.js after changing its version
+npm run mcp        # the MCP server (stdio)
+npm run mcp:check  # typecheck it (node16 resolution; not covered by `build`)
+npm run mcp:smoke  # exercise it over real stdio
 npx cdk synth
 npx cdk deploy --outputs-file cdk-outputs.json
 ```
@@ -248,8 +350,9 @@ until the parent delegates, so the domain is switched on in a second pass.
 | `tools/delegate-ns.sh` | One-time NS delegation into the parent zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
 | `tools/freecad_selftest.py` | Exporter selection rules, against a fixture document |
-| `scripts/` | three.js vendoring, sample model, dev server |
-| `test/` | Stack assertions + handler and edge-function units |
+| `tools/mcp/` | stdio MCP server: export, inspect, publish, for other AI harnesses |
+| `scripts/` | three.js vendoring, sample model, dev server, MCP stdio smoke test |
+| `test/` | Stack assertions + handler, edge-function and MCP units |
 
 ## Known limits
 
@@ -263,3 +366,7 @@ until the parent delegates, so the domain is switched on in a second pass.
   cleaned up by deleting the revision or the project.
 - The admin app cannot be exercised locally — Cognito sign-in needs the deployed
   Hosted UI.
+- The MCP server publishes but cannot list, edit, delete or read feedback: those
+  routes need a Cognito JWT from a Google sign-in, which a headless server has no
+  way to complete. Adding them would mean IAM-authorised variants of those routes
+  in the stack.
