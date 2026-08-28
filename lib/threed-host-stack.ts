@@ -147,6 +147,12 @@ export class ThreedHostStack extends Stack {
       hostedZone = new route53.PublicHostedZone(this, 'HostedZone', {
         zoneName: domainName,
       });
+      // Retained ahead of the move to the parent zone: resolvers cache the
+      // parent's NS delegation for up to its TTL (48h), so this zone has to keep
+      // answering after the stack stops managing it. CloudFormation takes the
+      // deletion policy from the last template that contained the resource, so
+      // this must be deployed BEFORE the zone is removed from the stack.
+      hostedZone.applyRemovalPolicy(RemovalPolicy.RETAIN);
       certificate = new acm.Certificate(this, 'Certificate', {
         domainName,
         validation: acm.CertificateValidation.fromDns(hostedZone),
@@ -249,8 +255,15 @@ export class ThreedHostStack extends Stack {
       const aliasTarget = route53.RecordTarget.fromAlias(
         new targets.CloudFrontTarget(distribution),
       );
-      new route53.ARecord(this, 'AliasA', { zone: hostedZone, target: aliasTarget });
-      new route53.AaaaRecord(this, 'AliasAaaa', { zone: hostedZone, target: aliasTarget });
+      const aliasA = new route53.ARecord(this, 'AliasA', { zone: hostedZone, target: aliasTarget });
+      const aliasAaaa = new route53.AaaaRecord(this, 'AliasAaaa', {
+        zone: hostedZone,
+        target: aliasTarget,
+      });
+      // Retained for the same reason as the zone: these are the answers a
+      // resolver holding the cached delegation still expects to find here.
+      aliasA.applyRemovalPolicy(RemovalPolicy.RETAIN);
+      aliasAaaa.applyRemovalPolicy(RemovalPolicy.RETAIN);
     }
 
     // =========================================================================
