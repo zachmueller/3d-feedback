@@ -17,6 +17,9 @@ import {
   newProject,
   computeLatest,
   reserveRevision,
+  normalizeContentHash,
+  findDuplicateRevision,
+  revisionForResume,
   buildManifest,
   parseUploadKey,
   validateComment,
@@ -34,6 +37,10 @@ import {
 // --- helpers ----------------------------------------------------------------
 
 const NOW = '2026-08-25T12:00:00.000Z';
+
+/** Two distinct sha256 digests, as a publisher would declare them. */
+const HASH_A = 'a'.repeat(64);
+const HASH_B = `${'b'.repeat(63)}9`;
 
 function glbHeader(version = 2, magic = 'glTF'): Uint8Array {
   const bytes = new Uint8Array(12);
@@ -260,6 +267,112 @@ describe('reserveRevision', () => {
     const rev = reserveRevision(meta, 'towel-clip', { now: NOW });
     meta.projects['towel-clip'].revisions[String(rev)].status = 'error';
     expect(reserveRevision(meta, 'towel-clip', { now: NOW })).toBe(2);
+  });
+
+  it('records the content hash it was given', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW, contentHash: HASH_A });
+    expect(meta.projects['towel-clip'].revisions['1'].contentHash).toBe(HASH_A);
+  });
+});
+
+// --- retry safety -----------------------------------------------------------
+
+describe('normalizeContentHash', () => {
+  it('accepts a sha256 digest, however it is cased or padded', () => {
+    expect(normalizeContentHash(HASH_A)).toBe(HASH_A);
+    expect(normalizeContentHash(`  ${HASH_A.toUpperCase()}  `)).toBe(HASH_A);
+  });
+
+  it('treats absent and empty as "not declared"', () => {
+    for (const input of [undefined, null, '', '   ']) {
+      expect(normalizeContentHash(input)).toBeNull();
+    }
+  });
+
+  it.each([
+    ['deadbeef', 'too short'],
+    [`${HASH_A}00`, 'too long'],
+    [HASH_A.replace('a', 'z'), 'not hex'],
+    ['sha256:' + HASH_A, 'prefixed'],
+  ])('rejects %s (%s)', (input) => {
+    expect(() => normalizeContentHash(input)).toThrow(/64 hexadecimal/);
+  });
+});
+
+describe('findDuplicateRevision', () => {
+  /** Two ready revisions, the older one carrying HASH_A and the newer HASH_B. */
+  const twoHashed = () => {
+    const meta = projectWith(2);
+    const project = meta.projects['towel-clip'];
+    project.revisions['1'].contentHash = HASH_A;
+    project.revisions['2'].contentHash = HASH_B;
+    return project;
+  };
+
+  it('matches the latest ready revision — the retry case', () => {
+    expect(findDuplicateRevision(twoHashed(), HASH_B)?.rev).toBe(2);
+  });
+
+  // Re-publishing the geometry of an older revision is a deliberate revert, and
+  // it deserves its own number rather than silently resolving to the old one.
+  it('ignores a match on an earlier revision', () => {
+    expect(findDuplicateRevision(twoHashed(), HASH_A)).toBeNull();
+  });
+
+  it('never matches without a hash on either side', () => {
+    expect(findDuplicateRevision(twoHashed(), null)).toBeNull();
+    expect(findDuplicateRevision(projectWith(1).projects['towel-clip'], HASH_A)).toBeNull();
+  });
+
+  // The latest *ready* revision, not the newest entry: a publish that is still
+  // processing or that failed must not shadow the revision people can see.
+  it('looks past a revision that is processing or failed', () => {
+    const meta = projectWith(1);
+    const project = meta.projects['towel-clip'];
+    project.revisions['1'].contentHash = HASH_A;
+    const rev = reserveRevision(meta, 'towel-clip', { now: NOW, contentHash: HASH_B });
+    project.revisions[String(rev)].status = 'error';
+    expect(findDuplicateRevision(project, HASH_A)?.rev).toBe(1);
+    expect(findDuplicateRevision(project, HASH_B)).toBeNull();
+  });
+
+  it('finds nothing in a project with no ready revision at all', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW, contentHash: HASH_A });
+    expect(findDuplicateRevision(meta.projects['towel-clip'], HASH_A)).toBeNull();
+  });
+});
+
+describe('revisionForResume', () => {
+  it('accepts a revision that is still processing', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW });
+    const check = revisionForResume(meta.projects['towel-clip'], 1);
+    expect(check.ok && check.entry.rev).toBe(1);
+  });
+
+  it('accepts a revision whose processing failed', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW });
+    meta.projects['towel-clip'].revisions['1'].status = 'error';
+    expect(revisionForResume(meta.projects['towel-clip'], 1).ok).toBe(true);
+  });
+
+  it('404s on a number that was never reserved', () => {
+    const check = revisionForResume(projectWith(1).projects['towel-clip'], 9);
+    expect(check).toEqual({ ok: false, status: 404, error: expect.stringMatching(/never reserved/) });
+  });
+
+  // The model is served with a one-year immutable Cache-Control, so replacing
+  // the bytes under a shared URL would leave the CDN serving the old ones.
+  it('409s on a revision that is already published', () => {
+    const check = revisionForResume(projectWith(1).projects['towel-clip'], 1);
+    expect(check).toEqual({
+      ok: false,
+      status: 409,
+      error: expect.stringMatching(/already published/),
+    });
   });
 });
 

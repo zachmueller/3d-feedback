@@ -76,6 +76,9 @@ export const RESERVED_SLUGS = [
 /** Lowercase, hyphen-separated, 1–64 chars, no leading/trailing hyphen. */
 export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 
+/** A sha256 digest as lowercase hex, which is how a publisher declares one. */
+export const CONTENT_HASH_RE = /^[0-9a-f]{64}$/;
+
 /**
  * Ceiling on the uploaded model. A presigned PUT has no size limit of its own,
  * so the processor re-checks the object size from the S3 event. iOS Safari is
@@ -121,6 +124,8 @@ export interface RevisionEntry {
   bytes?: number;
   commentCount?: number;
   error?: string;
+  /** sha256 the publisher declared for the model; see normalizeContentHash. */
+  contentHash?: string | null;
 }
 
 export interface ProjectEntry {
@@ -192,6 +197,26 @@ export function normalizeSlug(input: unknown): string {
   }
   if (isReservedSlug(slug)) throw new BadRequest(`project "${slug}" is reserved`);
   return slug;
+}
+
+/**
+ * Validate the sha256 a publisher declares for the model it is about to upload.
+ *
+ * This is an **idempotency key, not an integrity check**. The publisher hashes
+ * the exact bytes it then PUTs, and TLS plus S3's own checksums already cover the
+ * transfer, so nothing here re-reads the model to confirm the digest — that would
+ * mean pulling up to 100 MB back through this function for protection the
+ * transport already gives. What it buys is `findDuplicateRevision`: a retried
+ * publish is recognised instead of burning a revision number.
+ */
+export function normalizeContentHash(input: unknown): string | null {
+  if (input === undefined || input === null) return null;
+  const hash = String(input).trim().toLowerCase();
+  if (!hash) return null;
+  if (!CONTENT_HASH_RE.test(hash)) {
+    throw new BadRequest('contentHash must be a sha256 digest as 64 hexadecimal characters');
+  }
+  return hash;
 }
 
 /** Parse a revision number: a positive integer, however it arrived. */
@@ -274,7 +299,13 @@ export function computeLatest(project: ProjectEntry): number | null {
 export function reserveRevision(
   meta: Metadata,
   slug: string,
-  opts: { title?: string | null; notes?: string | null; filename?: string | null; now: string },
+  opts: {
+    title?: string | null;
+    notes?: string | null;
+    filename?: string | null;
+    contentHash?: string | null;
+    now: string;
+  },
 ): number {
   const project = (meta.projects[slug] ??= newProject(slug, opts.now));
   if (opts.title) project.title = opts.title;
@@ -286,8 +317,66 @@ export function reserveRevision(
     notes: opts.notes ?? null,
     filename: opts.filename ?? null,
     reservedAt: opts.now,
+    contentHash: opts.contentHash ?? null,
   };
   return rev;
+}
+
+/**
+ * The revision that a publish of these exact bytes would duplicate, or null.
+ *
+ * Only the latest ready revision counts. The case worth collapsing is a retry
+ * after a timeout or a lost response, which re-uploads what just landed; matching
+ * against every revision instead would silently swallow a deliberate revert to
+ * older geometry, which is a real new revision and deserves its own number.
+ *
+ * Entries published before contentHash existed carry none, so they never match.
+ */
+export function findDuplicateRevision(
+  project: ProjectEntry,
+  contentHash: string | null,
+): RevisionEntry | null {
+  if (!contentHash) return null;
+  const latest = computeLatest(project);
+  if (latest === null) return null;
+  const entry = project.revisions[String(latest)];
+  return entry?.contentHash === contentHash ? entry : null;
+}
+
+export type ResumeCheck =
+  | { ok: true; entry: RevisionEntry }
+  | { ok: false; status: 404 | 409; error: string };
+
+/**
+ * Whether an already-reserved revision can be handed a fresh upload URL.
+ *
+ * This is the way out of a publish that reserved a number and then failed: the
+ * upload died, the processor rejected the file, or the client stopped waiting.
+ * Without it the only recovery is another publish, which burns another number.
+ *
+ * A `ready` revision is refused. Its model is served with a one-year immutable
+ * Cache-Control, so replacing the bytes under a URL that has already been shared
+ * would leave the CDN and every browser holding the old ones indefinitely.
+ */
+export function revisionForResume(project: ProjectEntry, rev: number): ResumeCheck {
+  const entry = project.revisions[String(rev)];
+  if (!entry) {
+    return {
+      ok: false,
+      status: 404,
+      error: `Revision ${rev} of "${project.slug}" was never reserved`,
+    };
+  }
+  if (entry.status === 'ready') {
+    return {
+      ok: false,
+      status: 409,
+      error:
+        `Revision ${rev} of "${project.slug}" is already published. A revision's model is ` +
+        'immutable and cached for a year, so publish a new revision instead of replacing it.',
+    };
+  }
+  return { ok: true, entry };
 }
 
 /** Project the private index down to what the viewer is allowed to see. */
@@ -706,6 +795,15 @@ export function actionFromPath(event: any): string {
  * dance. The URL is returned before the upload happens, so the caller can print
  * it immediately and poll `status/<slug>/<rev>.json` for readiness.
  *
+ * Three optional fields make a retry safe, because revision numbers are never
+ * reused and a client that retries blindly spends them:
+ *
+ *   contentHash  sha256 of the model. When it matches the latest ready revision
+ *                the existing revision is returned with no uploadUrl — nothing is
+ *                reserved, nothing is uploaded. `force: true` publishes anyway.
+ *   revision     Re-presign an upload for a revision that was already reserved
+ *                but never finished, instead of taking a new number.
+ *
  * ContentType is deliberately left out of the signed request so a plain
  * `curl -T` (which sends application/octet-stream) still matches the signature;
  * the processor sets the real Content-Type when it copies the object.
@@ -718,14 +816,67 @@ async function actionPublish(event: any) {
   const title = optionalText(body.title, MAX_TITLE_LEN);
   const notes = optionalText(body.notes ?? body.revisionNotes, MAX_NOTES_LEN);
   const filename = sanitizeFilename(body.filename);
+  const contentHash = normalizeContentHash(body.contentHash);
+  const force = body.force === true || body.force === 'true';
+  const resuming = body.revision !== undefined && body.revision !== null;
+  const resumeRev = resuming ? parseRevision(body.revision) : null;
   const now = new Date().toISOString();
 
   const staging = env('STAGING_BUCKET');
   const assets = env('ASSETS_BUCKET');
 
-  let rev = 0;
+  // Read first, then mutate — the same shape actionDelete uses, so a 404 or a
+  // 409 answers without rewriting metadata. Two publishes racing on the same
+  // project could still both get past this; the conditional write below is what
+  // keeps the index itself consistent.
+  const existing = (await readMetadata()).projects[slug];
+
+  if (resumeRev !== null) {
+    if (!existing) return json(404, { error: `No such project "${slug}"` });
+    const check = revisionForResume(existing, resumeRev);
+    if (!check.ok) return json(check.status, { error: check.error });
+  } else if (existing && !force) {
+    const duplicate = findDuplicateRevision(existing, contentHash);
+    if (duplicate) {
+      return json(200, {
+        project: slug,
+        revision: duplicate.rev,
+        url: shareUrl(slug, duplicate.rev),
+        statusUrl: `${siteUrl()}/${statusKey(slug, duplicate.rev)}`,
+        deduped: true,
+        publishedAt: duplicate.publishedAt ?? null,
+        // No uploadUrl: there is nothing to upload. Title and notes are not
+        // applied either — an existing revision's text is edited from /admin.
+        message:
+          `Revision ${duplicate.rev} already holds these exact bytes; nothing was published. ` +
+          'Pass force to publish them again as a new revision.',
+      });
+    }
+  }
+
+  let rev = resumeRev ?? 0;
   await mutateMetadata((meta) => {
-    rev = reserveRevision(meta, slug, { title, notes, filename, now });
+    if (resumeRev === null) {
+      rev = reserveRevision(meta, slug, { title, notes, filename, contentHash, now });
+      return;
+    }
+    // Resume: the same number, back to processing, with whatever the caller
+    // supplied this time. Re-checked inside the mutation because the read above
+    // and this write are not one atomic step.
+    const project = meta.projects[slug];
+    const check = project ? revisionForResume(project, resumeRev) : null;
+    if (!project || !check?.ok) {
+      throw new BadRequest(check && !check.ok ? check.error : `No such project "${slug}"`);
+    }
+    if (title) project.title = title;
+    const entry = check.entry;
+    entry.status = 'processing';
+    entry.filename = filename;
+    if (notes !== null) entry.notes = notes;
+    if (contentHash !== null) entry.contentHash = contentHash;
+    delete entry.error;
+    delete entry.publishedAt;
+    delete entry.bytes;
   });
 
   await writeJson(
@@ -750,6 +901,7 @@ async function actionPublish(event: any) {
     uploadUrl,
     key,
     expiresIn: 900,
+    ...(resumeRev === null ? {} : { resumed: true }),
   });
 }
 

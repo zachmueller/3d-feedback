@@ -12,7 +12,9 @@
  *  2. check_setup answers, and says whether publishing is actually wired up;
  *  3. inspect_glb reports the sample model's parts panel correctly — three parts
  *     with `ref_Wall Panel` switched off, matching what the viewer would render;
- *  4. stdout carried nothing but JSON-RPC. A stray console.log anywhere in the
+ *  4. list_revisions reaches the deployed site and reports an absent project as
+ *     "nothing published" rather than as an error;
+ *  5. stdout carried nothing but JSON-RPC. A stray console.log anywhere in the
  *     server or its dependencies would corrupt the protocol, and this is the only
  *     place that would notice.
  *
@@ -126,11 +128,19 @@ const textOf = (response) =>
     'check_setup',
     'convert_and_publish',
     'export_glb',
+    'get_feedback',
+    'get_publish_status',
     'gui_export_instructions',
     'inspect_glb',
+    'list_revisions',
     'publish_model',
+    'verify_revision',
   ];
-  check('tools/list returns all six tools', names.join(',') === expected.join(','), names.join(','));
+  check(
+    `tools/list returns all ${expected.length} tools`,
+    names.join(',') === expected.join(','),
+    names.join(','),
+  );
 
   const setup = await request('tools/call', { name: 'check_setup', arguments: {} });
   const setupText = textOf(setup);
@@ -170,6 +180,20 @@ const textOf = (response) =>
     'a non-.glb argument is rejected as a tool error',
     bad.result?.isError === true && /must end in \.glb/.test(textOf(bad)),
     textOf(bad).slice(0, 200),
+  );
+
+  // One real read against the deployment: a project that cannot exist (the slug is
+  // valid, so this exercises the request rather than the validator). It reserves
+  // nothing and uploads nothing, and it is the only check here that needs network.
+  const missing = await request('tools/call', {
+    name: 'list_revisions',
+    arguments: { project: 'smoke-test-no-such-project' },
+  });
+  const missingText = textOf(missing);
+  check(
+    'list_revisions reads the site and reports an absent project',
+    !missing.result?.isError && /Nothing published under/.test(missingText),
+    missingText.slice(0, 300),
   );
 
   check(

@@ -35,7 +35,12 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
+    "@aws-crypto/sha256-js": "^5.2.0",
+    "@aws-sdk/client-sts": "^3.1120.0",
+    "@aws-sdk/credential-providers": "^3.1120.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
+    "@smithy/protocol-http": "^5.6.2",
+    "@smithy/signature-v4": "^5.7.3",
     "aws-cdk-lib": "^2.260.0",
     "constructs": "^10.3.0",
     "three": "^0.169.0",

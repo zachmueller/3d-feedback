@@ -3,12 +3,14 @@
  *
  *   npm run mcp        # or point a harness at it; see README, "MCP server"
  *
- * It wraps the whole publish path — FreeCAD document → .glb → revision URL — so
- * another AI harness does not have to rediscover the parts of it that are not
- * guessable: that `freecadcmd` is not on PATH, that the exporter needs a `--`
- * separator, that only `.glb` is accepted, that a `ref_` label prefix marks
- * reference geometry, which AWS profile signs the publish request, and that
- * revision numbers are burned permanently even by a throwaway publish.
+ * It wraps the whole loop — FreeCAD document → .glb → revision URL → the feedback
+ * that comes back — so another AI harness does not have to rediscover the parts of
+ * it that are not guessable: that `freecadcmd` is not on PATH, that the exporter
+ * needs a `--` separator, that only `.glb` is accepted, that a `ref_` label prefix
+ * marks reference geometry, which AWS profile signs the publish request, that
+ * revision numbers are burned permanently even by a throwaway publish (and what to
+ * do about a publish that died holding one), and that the viewer's own objects are
+ * public, which is what lets the read tools work with no credentials at all.
  *
  * Everything environment-specific is configuration (tools/mcp/config.ts), so the
  * same server can be handed to several harnesses with different limits.
@@ -26,19 +28,35 @@ import { z } from 'zod';
 import { BadRequest } from '../../lib/lambda/handler';
 import { version as packageVersion } from '../../package.json';
 
+import { CredentialError } from './aws';
 import {
   activeTools,
   ConfigError,
   type LoadedConfig,
   loadConfig,
   PathError,
+  resolveProject,
   resolveUserPath,
   type ToolName,
 } from './config';
 import { checkSetup, type SetupReport } from './doctor';
 import { exportGlb, guiExportSnippet } from './freecad';
 import { formatBytes, GlbError, type GlbReport, inspectGlb } from './glb';
-import { publishModel, type PublishResult } from './publish';
+import { PublishError, publishModel, type PublishResult } from './publish';
+import {
+  describeStatus,
+  type FeedbackItem,
+  fetchFeedback,
+  fetchManifest,
+  fetchStatus,
+  type ProjectReport,
+  projectReport,
+  siteReader,
+  SiteError,
+  type StatusObject,
+  type VerifyReport,
+  verifyRevision,
+} from './site';
 
 // --- logging (stderr only) ---------------------------------------------------
 
@@ -84,13 +102,20 @@ function ok(summary: string[], data: unknown): ToolResult {
 /**
  * Turn a thrown error into a tool error.
  *
- * BadRequest (from the Lambda's own validators), PathError and GlbError are all
- * caller-fixable and carry messages written for a caller, so they pass through
- * verbatim. Anything else is reported with its message too — every throw site
- * here writes one meant to be read — with the stack kept for the log.
+ * BadRequest (from the Lambda's own validators), PathError, GlbError, SiteError,
+ * CredentialError and PublishError are all caller-fixable and carry messages
+ * written for a caller, so they pass through verbatim. Anything else is reported
+ * with its message too — every throw site here writes one meant to be read — with
+ * the stack kept for the log.
  */
 function fail(err: unknown, log: ReturnType<typeof makeLogger>): ToolResult {
-  const expected = err instanceof BadRequest || err instanceof PathError || err instanceof GlbError;
+  const expected =
+    err instanceof BadRequest ||
+    err instanceof PathError ||
+    err instanceof GlbError ||
+    err instanceof SiteError ||
+    err instanceof CredentialError ||
+    err instanceof PublishError;
   const message = err instanceof Error ? err.message : String(err);
   log(expected ? 'info' : 'error', 'tool failed', {
     message,
@@ -124,15 +149,84 @@ function glbSummary(report: GlbReport): string[] {
 function publishSummary(result: PublishResult): string[] {
   if (result.dryRun) {
     return [
-      'DRY RUN — nothing was published (dryRun is on).',
-      `Would publish ${formatBytes(result.bytes)} to project "${result.project}" with:`,
-      `  ${result.command}`,
+      'DRY RUN — nothing was reserved, uploaded or published (dryRun is on).',
+      `Would send ${formatBytes(result.bytes)} to ${result.plannedRequest?.url} as:`,
+      '```json',
+      JSON.stringify(result.plannedRequest?.body, null, 2),
+      '```',
     ];
   }
-  return [
-    `Published ${result.project} revision ${result.revision}: ${result.url}`,
-    'Send that URL to a reviewer; comments land on this revision only.',
+
+  const lines = result.deduped
+    ? [
+        `Nothing published — revision ${result.revision} of "${result.project}" already holds these ` +
+          'exact bytes, so no revision number was spent.',
+        `Its URL is ${result.url}. Pass force to publish them again as a new revision anyway.`,
+      ]
+    : [
+        `Published ${result.project} revision ${result.revision}` +
+          (result.resumed ? ' (finished the number already reserved, so there is no gap)' : '') +
+          `: ${result.url}`,
+        'Send that URL to a reviewer; comments land on this revision only.',
+      ];
+
+  for (const line of result.log) lines.push(`  · ${line}`);
+  if (result.verification) lines.push('', ...verifySummary(result.verification));
+  return lines;
+}
+
+function verifySummary(report: VerifyReport): string[] {
+  const lines = [
+    report.ok
+      ? `Verified: ${report.url} serves, and so does its model.`
+      : `VERIFICATION FAILED for ${report.url} — the revision exists, but this is what a reviewer would get:`,
   ];
+  for (const check of report.checks) {
+    lines.push(`  ${check.ok ? 'ok  ' : 'FAIL'} ${check.name}: ${check.detail}`);
+  }
+  return lines;
+}
+
+function projectSummary(report: ProjectReport): string[] {
+  const lines = [
+    `${report.project}${report.title ? ` — "${report.title}"` : ''}: ` +
+      `${report.revisions.length} published revision(s)` +
+      (report.latest === null
+        ? ', none of them ready yet'
+        : `, latest is ${report.latest} (${report.latestUrl})`),
+    `The bare ${report.projectUrl} always lands on the latest.`,
+  ];
+  // Newest first: the interesting one is the one just published.
+  for (const rev of [...report.revisions].reverse()) {
+    lines.push(
+      `  ${String(rev.rev).padStart(3)}${rev.isLatest ? ' *' : '  '} ` +
+        `${rev.publishedAt?.slice(0, 10) ?? '(unknown date)'}  ` +
+        `${rev.bytes === null ? '' : formatBytes(rev.bytes).padStart(9)}  ` +
+        `${rev.commentCount} comment(s)  ${rev.url}`,
+    );
+    if (rev.notes) lines.push(`        ${rev.notes}`);
+  }
+  return lines;
+}
+
+function feedbackSummary(project: string, items: FeedbackItem[], revisions: number[]): string[] {
+  if (!items.length) {
+    return [
+      `No feedback on ${project} yet${revisions.length ? ` (checked revision(s) ${revisions.join(', ')})` : ''}.`,
+    ];
+  }
+  const lines = [
+    `${items.length} comment(s) on ${project}, newest first, across revision(s) ${revisions.join(', ')}:`,
+  ];
+  for (const item of items) {
+    lines.push(`  [${item.at?.slice(0, 16).replace('T', ' ')}] ${item.name} on revision ${item.revision}`);
+    for (const line of item.text.split('\n')) lines.push(`      ${line}`);
+  }
+  return lines;
+}
+
+function statusSummary(status: StatusObject, siteUrl: string): string[] {
+  return [describeStatus(status, siteUrl)];
 }
 
 function setupSummary(report: SetupReport): string[] {
@@ -201,6 +295,41 @@ const outField = z
   .string()
   .optional()
   .describe('Where to write the .glb. Defaults to <workDir>/<document name>.glb.');
+
+const revisionField = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe(
+    'Finish a revision that was already reserved but never completed — the number a failed ' +
+      'publish reported. The upload is retried against that same number instead of spending a ' +
+      'new one. Refused if the revision is already published, since its model is immutable.',
+  );
+
+const forceField = z
+  .boolean()
+  .optional()
+  .describe(
+    'Publish even when these exact bytes are already the latest revision. Without it, an ' +
+      'identical publish is recognised and returns the existing revision instead of spending a ' +
+      'new number — which is what makes a retry safe.',
+  );
+
+const readRevisionField = z
+  .number()
+  .int()
+  .positive()
+  .optional()
+  .describe('Revision number. Defaults to the latest published one.');
+
+const readProjectField = z
+  .string()
+  .optional()
+  .describe(
+    'Project slug — the first path segment of the share URL. There is no public list of ' +
+      'projects, so this has to be one you know; it defaults to the configured defaultProject.',
+  );
 
 // --- registration ------------------------------------------------------------
 
@@ -363,17 +492,21 @@ function registerTools(
         description:
           'Publish an existing .glb as the next revision of a project and return its share URL. ' +
           'Signs POST /publish with the configured AWS profile, uploads to the presigned PUT, ' +
-          'and waits for the processor. Checks the file locally first, because the processor ' +
-          'rejects anything that is not glTF 2.0 binary or is over 100 MB. Note that revision ' +
-          'numbers are monotonic and NEVER reused — a throwaway publish burns a number ' +
-          'permanently — so inspect first if unsure. Editing and deleting revisions is not ' +
-          'available here; use the /admin app.',
+          'waits for the processor, then checks that the URL really serves. Checks the file ' +
+          'locally first, because the processor rejects anything that is not glTF 2.0 binary or ' +
+          'is over 100 MB. Revision numbers are monotonic and NEVER reused, so retries are made ' +
+          'safe two ways: publishing bytes identical to the latest revision returns that revision ' +
+          'instead of spending a number, and a publish that failed after reserving one can be ' +
+          'finished by passing its revision. Editing and deleting revisions is not available ' +
+          'here; use the /admin app.',
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         inputSchema: {
           glb: z.string().describe('Path to the .glb to publish.'),
           project: projectField,
           title: titleField,
           notes: notesField,
+          revision: revisionField,
+          force: forceField,
           timeoutSeconds: z
             .number()
             .positive()
@@ -422,6 +555,8 @@ function registerTools(
           project: projectField,
           title: titleField,
           notes: notesField,
+          revision: revisionField,
+          force: forceField,
           out: outField,
           linearDeflection: linearDeflectionField,
           angularDeflection: angularDeflectionField,
@@ -452,21 +587,201 @@ function registerTools(
       },
     );
   }
+
+  // --- reading the deployment ------------------------------------------------
+  // All four read the public objects the viewer reads, straight off the
+  // distribution: no credentials, no API call, nothing reserved. They start from
+  // a slug because there is no public index of projects — listing them all is an
+  // /admin route behind Cognito.
+
+  if (enabled('list_revisions')) {
+    server.registerTool(
+      'list_revisions',
+      {
+        title: 'List a project’s published revisions',
+        description:
+          "Read a project's public manifest: its title, which revision is latest, and every " +
+          'published revision with its notes, size, comment count and share URL. This is what a ' +
+          'reviewer can see, so it also answers "did my publish actually appear?" and "what did I ' +
+          'tell them changed last time?". Nothing that is still processing or that failed appears ' +
+          'here — use get_publish_status for those.',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        inputSchema: { project: readProjectField },
+      },
+      async ({ project }) => {
+        try {
+          const slug = resolveProject(cfg, project);
+          const reader = siteReader(cfg);
+          const manifest = await fetchManifest(reader, slug);
+          if (!manifest) {
+            return ok(
+              [
+                `Nothing published under "${slug}": either the project does not exist, or no ` +
+                  'revision has finished processing yet (get_publish_status can say which).',
+              ],
+              { project: slug, exists: false },
+            );
+          }
+          const report = projectReport(manifest, reader.siteUrl);
+          return ok(projectSummary(report), { exists: true, ...report });
+        } catch (err) {
+          return fail(err, log);
+        }
+      },
+    );
+  }
+
+  if (enabled('get_publish_status')) {
+    server.registerTool(
+      'get_publish_status',
+      {
+        title: 'Check what happened to a publish',
+        description:
+          'Read the status object a publish writes: processing, ready (with the share URL), or ' +
+          'error (with the reason the processor rejected it). This is the tool for a publish whose ' +
+          'wait timed out or whose result was lost — the number was reserved either way, and this ' +
+          'says whether it landed. A revision reported as error or still processing can be ' +
+          'retried by passing its number as `revision` to publish_model, which reuses it instead ' +
+          'of spending a new one.',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        inputSchema: { project: readProjectField, revision: readRevisionField },
+      },
+      async ({ project, revision }) => {
+        try {
+          const slug = resolveProject(cfg, project);
+          const reader = siteReader(cfg);
+          let rev = revision ?? null;
+          if (rev === null) {
+            rev = (await fetchManifest(reader, slug))?.latest ?? null;
+            if (rev === null) {
+              throw new BadRequest(
+                `No published revision of "${slug}" to fall back on, so pass revision ` +
+                  'explicitly — a failed publish reports the number it reserved.',
+              );
+            }
+          }
+          const status = await fetchStatus(reader, slug, rev);
+          if (!status) {
+            return ok(
+              [
+                `No status object for ${slug} revision ${rev}. That number was never reserved, or ` +
+                  'the revision has since been deleted.',
+              ],
+              { project: slug, revision: rev, status: null },
+            );
+          }
+          return ok(statusSummary(status, reader.siteUrl), status);
+        } catch (err) {
+          return fail(err, log);
+        }
+      },
+    );
+  }
+
+  if (enabled('get_feedback')) {
+    server.registerTool(
+      'get_feedback',
+      {
+        title: 'Read the feedback on a project',
+        description:
+          "Read the reviewer comments on one revision, or across every revision of a project, " +
+          'newest first. This closes the loop the host exists for: publish, send the link, read ' +
+          'what came back, iterate. Comments are public and anonymous-capable, so treat the names ' +
+          'as self-reported. Deleting a comment is not possible here — that means deleting the ' +
+          'revision or the project from /admin.',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        inputSchema: {
+          project: projectField,
+          revision: z
+            .number()
+            .int()
+            .positive()
+            .optional()
+            .describe('Only this revision. Omit to roll up every revision that has comments.'),
+        },
+      },
+      async ({ project, revision }) => {
+        try {
+          const slug = resolveProject(cfg, project);
+          const reader = siteReader(cfg);
+          const { items, revisionsRead, manifest } = await fetchFeedback(reader, slug, revision ?? null);
+          if (!manifest && revision === undefined) {
+            return ok([`Nothing published under "${slug}", so there is no feedback to read.`], {
+              project: slug,
+              exists: false,
+              items: [],
+            });
+          }
+          return ok(feedbackSummary(slug, items, revisionsRead), {
+            project: slug,
+            revisions: revisionsRead,
+            count: items.length,
+            items,
+          });
+        } catch (err) {
+          return fail(err, log);
+        }
+      },
+    );
+  }
+
+  if (enabled('verify_revision')) {
+    server.registerTool(
+      'verify_revision',
+      {
+        title: 'Check that a revision really serves',
+        description:
+          'Fetch a revision the way a reviewer would: its share page, then its model, checking ' +
+          'the status, the content type, that the model is cached as immutable, and that the size ' +
+          'served matches what the manifest recorded. A ready status only means the processor ' +
+          'copied the file inside AWS; this is what proves the distribution, its origin access ' +
+          'control, the certificate and DNS all agree — which matters most for a link already sent.',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        inputSchema: { project: readProjectField, revision: readRevisionField },
+      },
+      async ({ project, revision }) => {
+        try {
+          const slug = resolveProject(cfg, project);
+          const reader = siteReader(cfg);
+          const manifest = await fetchManifest(reader, slug);
+          const rev = revision ?? manifest?.latest ?? null;
+          if (rev === null) {
+            throw new BadRequest(
+              `No published revision of "${slug}" to verify. Pass revision explicitly, or check ` +
+                'get_publish_status if a publish is still in flight.',
+            );
+          }
+          const expectedBytes = manifest?.revisions.find((r) => r.rev === rev)?.bytes ?? null;
+          const report = await verifyRevision(reader, slug, rev, expectedBytes);
+          return ok(verifySummary(report), report);
+        } catch (err) {
+          return fail(err, log);
+        }
+      },
+    );
+  }
 }
 
 const INSTRUCTIONS = [
-  'Publishes 3D models to the 3d.zach.nz review host: a project accumulates numbered',
-  'revisions, each with its own public URL and feedback thread.',
+  'Publishes 3D models to the 3d.zach.nz review host and reads back what reviewers say:',
+  'a project accumulates numbered revisions, each with its own public URL and feedback',
+  'thread.',
   '',
   'Usual path: convert_and_publish(fcstd, project, notes) → share URL.',
   'Careful path: export_glb → inspect_glb → publish_model, when the parts panel matters.',
   'From an open FreeCAD: gui_export_instructions → run the snippet there → publish_model.',
+  'Then: list_revisions to see what a reviewer sees, get_feedback to read the replies.',
   '',
-  'Two things worth knowing before publishing: revision numbers are never reused, so a',
-  'throwaway publish burns one permanently; and the FreeCAD object Labels in the document',
-  'become the viewer\'s parts-panel checkboxes, with a `ref_` prefix marking context',
-  'geometry that starts hidden. Reading or deleting feedback is not available here — that',
-  'is the /admin app.',
+  'Three things worth knowing before publishing. Revision numbers are never reused, so a',
+  'throwaway publish burns one permanently — but a retry is safe: identical bytes return',
+  'the revision that already holds them, and a publish that failed after reserving a',
+  'number can be finished by passing that number as `revision`. If a publish times out,',
+  'get_publish_status says whether it landed rather than guessing. And the FreeCAD object',
+  "Labels in the document become the viewer's parts-panel checkboxes, with a `ref_` prefix",
+  'marking context geometry that starts hidden.',
+  '',
+  'Editing notes, deleting a revision and listing every project are not available here:',
+  'those routes need a Google sign-in, so they live in the /admin app.',
   '',
   'Run check_setup when anything fails: it names the broken link and its fix.',
 ].join('\n');

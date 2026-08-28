@@ -5,18 +5,19 @@
  * broken and what fixes it, because the alternative is a tool call that fails
  * halfway through an export with a message about signatures. Everything here is
  * read-only and cheap: no revision is reserved and nothing is uploaded.
+ *
+ * The list is short now. Publishing used to need bash, the AWS CLI, jq and a curl
+ * with --aws-sigv4, and each of those was a probe; it signs and uploads in this
+ * process instead, so what is left to check is FreeCAD (for the export), the
+ * credentials, and the two endpoints.
  */
 import { execFile } from 'child_process';
 import * as fs from 'fs';
 import { promisify } from 'util';
 
-import {
-  type ConfigSource,
-  type Config,
-  type LoadedConfig,
-  type ToolName,
-  whichBinary,
-} from './config';
+import { callerIdentity, CredentialError, credentialFix, whoIsSigning } from './aws';
+import { type ConfigSource, type Config, type LoadedConfig, type ToolName } from './config';
+import { errorDetail, nodeFetch, request } from './http';
 
 const execFileAsync = promisify(execFile);
 
@@ -111,70 +112,66 @@ function probeWorkDir(cfg: Config): Probe {
   }
 }
 
-function probeBinary(name: string, install: string): Probe {
-  const found = whichBinary(name);
-  return {
-    name,
-    ok: Boolean(found),
-    detail: found ?? 'not on PATH',
-    fix: found ? undefined : install,
-  };
-}
-
-/** publish.sh signs with curl, which only grew --aws-sigv4 in 7.75. */
-async function probeCurlSigv4(): Promise<Probe> {
-  const run = await tryRun('curl', ['--help', 'all'], 5000);
-  const supported = run.out.includes('--aws-sigv4');
-  return {
-    name: 'curl --aws-sigv4',
-    ok: supported,
-    detail: supported ? 'supported' : 'this curl cannot sign SigV4 requests',
-    fix: supported ? undefined : 'Install curl >= 7.75 (macOS ships 8.x; a stripped-down build may not).',
-  };
-}
-
+/**
+ * Who the configured profile is, resolved through the same SDK chain that signs a
+ * publish — so this probe fails exactly when publishing would.
+ *
+ * The failure worth catching is credentials that are live but for the wrong
+ * account: publishing then gets an opaque 403 from execute-api's IAM authorizer,
+ * which says nothing about profiles. The expected account comes from the
+ * PublishRouteArn output.
+ */
 async function probeIdentity(cfg: Config, deploymentAccount: string | null): Promise<Probe> {
-  if (!whichBinary('aws')) {
-    return { name: 'aws credentials', ok: null, detail: 'skipped — no aws CLI' };
-  }
-  const args = ['sts', 'get-caller-identity', '--output', 'json'];
-  if (cfg.awsProfile) args.push('--profile', cfg.awsProfile);
-  const run = await tryRun('aws', args, 20000);
-  const who = cfg.awsProfile ? `profile ${cfg.awsProfile}` : 'the default credential chain';
-  if (!run.ok) {
-    const expired = /token has expired|SSO session|sso-session|expired/i.test(run.out);
-    return {
-      name: 'aws credentials',
-      ok: false,
-      detail: `${who}: ${firstLine(run.out)}`,
-      fix: expired
-        ? `Run: aws sso login${cfg.awsProfile ? ` --profile ${cfg.awsProfile}` : ''}`
-        : 'Set THREED_AWS_PROFILE to a profile with access to the deployment account.',
-    };
-  }
-  let arn = firstLine(run.out);
-  let account: string | null = null;
+  const who = whoIsSigning(cfg.awsProfile);
   try {
-    const parsed = JSON.parse(run.out);
-    account = String(parsed.Account);
-    arn = `${parsed.Arn} (account ${account})`;
-  } catch {
-    /* keep the raw first line */
-  }
-
-  // Valid credentials for the wrong account is the failure worth catching here:
-  // publishing would get an opaque 403 from execute-api's IAM authorizer, which
-  // says nothing about profiles. The expected account comes from the
-  // PublishRouteArn output.
-  if (account && deploymentAccount && account !== deploymentAccount) {
+    const identity = await callerIdentity(cfg.awsProfile, cfg.awsRegion);
+    if (deploymentAccount && identity.account !== deploymentAccount) {
+      return {
+        name: 'aws credentials',
+        ok: false,
+        detail: `${who} → ${identity.arn} (account ${identity.account}), but the deployment is in account ${deploymentAccount}`,
+        fix: 'Set THREED_AWS_PROFILE to a profile in the deployment account. An ambient AWS_PROFILE from the shell is the usual cause.',
+      };
+    }
+    return {
+      name: 'aws credentials',
+      ok: true,
+      detail: `${who} → ${identity.arn} (account ${identity.account})`,
+    };
+  } catch (err) {
     return {
       name: 'aws credentials',
       ok: false,
-      detail: `${who} → ${arn}, but the deployment is in account ${deploymentAccount}`,
-      fix: 'Set THREED_AWS_PROFILE to a profile in the deployment account. An ambient AWS_PROFILE from the shell is the usual cause.',
+      detail: err instanceof CredentialError ? err.reason : `${who}: ${String(err)}`,
+      fix: err instanceof CredentialError ? err.fix : credentialFix(err, cfg.awsProfile),
     };
   }
-  return { name: 'aws credentials', ok: true, detail: `${who} → ${arn}` };
+}
+
+/**
+ * Does the site answer at all? The read tools and the post-publish verification
+ * both go through the distribution rather than the API, so a broken certificate or
+ * a DNS record that never landed shows up here instead of inside a publish.
+ */
+async function probeSite(cfg: Config): Promise<Probe> {
+  if (!cfg.siteUrl) return { name: 'site', ok: null, detail: 'skipped — no site URL resolved' };
+  const result = await request(
+    nodeFetch,
+    cfg.siteUrl,
+    { method: 'GET' },
+    Math.round(cfg.httpTimeoutSeconds * 1000),
+  );
+  const ok = result.status >= 200 && result.status < 400;
+  return {
+    name: 'site',
+    ok,
+    detail: ok
+      ? `${cfg.siteUrl} → ${result.status}`
+      : `${cfg.siteUrl} → ${result.networkError ?? `HTTP ${result.status}: ${errorDetail(result)}`}`,
+    fix: ok
+      ? undefined
+      : 'Check the distribution, its certificate and the A/AAAA records in the parent zone (tools/parent-dns.sh --dry-run compares them).',
+  };
 }
 
 function probeEndpoint(name: string, value: string | null, source: ConfigSource): Probe {
@@ -198,14 +195,10 @@ export async function checkSetup(
   probes.push(await probeFreecad(cfg));
   probes.push(probeFile('exporter', cfg.exportScript, 'THREED_EXPORT_SCRIPT'));
   probes.push(probeWorkDir(cfg));
-  probes.push(probeFile('publish.sh', cfg.publishScript, 'THREED_PUBLISH_SCRIPT'));
-  probes.push(probeBinary('aws', 'Install the AWS CLI v2.'));
-  probes.push(probeBinary('jq', 'brew install jq'));
-  probes.push(probeBinary('bash', 'publish.sh needs bash, not sh.'));
-  probes.push(await probeCurlSigv4());
   probes.push(await probeIdentity(cfg, loaded.deploymentAccount));
   probes.push(probeEndpoint('apiUrl', cfg.apiUrl, loaded.sources.apiUrl));
   probes.push(probeEndpoint('siteUrl', cfg.siteUrl, loaded.sources.siteUrl));
+  probes.push(await probeSite(cfg));
   if (loaded.outputsProblem) {
     // Tolerated at load time so the export tools still work, but never silent.
     probes.push({
@@ -224,8 +217,8 @@ export async function checkSetup(
   }
 
   const notes: string[] = [
-    'No credentials are held by this server: publish.sh resolves them with ' +
-      '`aws configure export-credentials`, so only the profile *name* is configured here.',
+    'No credentials are held by this server: only a profile *name* is configured, and the ' +
+      'AWS SDK resolves it the way the CLI does (env, config files, assumed roles, SSO cache).',
   ];
   if (cfg.dryRun) notes.push('dryRun is on: publishing tools will report the command and stop.');
   if (!cfg.allowPublish) notes.push('allowPublish is off: the publishing tools are not registered.');
@@ -240,14 +233,8 @@ export async function checkSetup(
     config,
     probes,
     canExportHeadless: passed('freecadcmd') && passed('exporter') && passed('workDir'),
-    canPublish:
-      passed('publish.sh') &&
-      passed('aws') &&
-      passed('jq') &&
-      passed('bash') &&
-      passed('curl --aws-sigv4') &&
-      passed('aws credentials') &&
-      passed('apiUrl'),
+    // Credentials and an endpoint, and that is the whole list — no binaries.
+    canPublish: passed('aws credentials') && passed('apiUrl'),
     notes,
   };
 }

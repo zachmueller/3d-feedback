@@ -21,10 +21,10 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 
-// The model size cap is the Lambda's, not ours: lib/lambda/handler.ts enforces
-// it server-side from the S3 event. Importing it keeps the client-side check
-// from drifting into a friendlier-but-wrong number.
-import { MAX_MODEL_BYTES } from '../../lib/lambda/handler';
+// The model size cap and the slug rules are the Lambda's, not ours:
+// lib/lambda/handler.ts enforces both server-side. Importing them keeps the
+// client-side checks from drifting into friendlier-but-wrong ones.
+import { BadRequest, MAX_MODEL_BYTES, normalizeSlug } from '../../lib/lambda/handler';
 
 /** Server misconfiguration — refuse to start rather than run on silent defaults. */
 export class ConfigError extends Error {
@@ -48,12 +48,29 @@ export const TOOL_NAMES = [
   'inspect_glb',
   'publish_model',
   'convert_and_publish',
+  'list_revisions',
+  'get_publish_status',
+  'get_feedback',
+  'verify_revision',
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];
 
 /** Tools that write to the deployment; suppressed by `allowPublish: false`. */
 export const PUBLISHING_TOOLS: ToolName[] = ['publish_model', 'convert_and_publish'];
+
+/**
+ * Settings that used to exist, and why they don't. The loader refuses to start on
+ * an unknown key, which is right for a typo but unhelpful for a setting that was
+ * real last week — a harness whose env block still carries one deserves the
+ * reason, not a list of valid keys to diff by eye.
+ */
+export const REMOVED_KEYS: Record<string, { envName: string; why: string }> = {
+  publishScript: {
+    envName: 'THREED_PUBLISH_SCRIPT',
+    why: 'publishing no longer shells out to tools/publish.sh — it signs and uploads in this process, and the script is now a wrapper around the same code',
+  },
+};
 
 export interface Config {
   repoRoot: string;
@@ -62,7 +79,6 @@ export interface Config {
   apiUrl: string | null;
   siteUrl: string | null;
   outputsFile: string;
-  publishScript: string;
   exportScript: string;
   freecadcmd: string | null;
   workDir: string;
@@ -71,6 +87,10 @@ export interface Config {
   defaultAngularDeflection: number | null;
   freecadTimeoutSeconds: number;
   publishTimeoutSeconds: number;
+  /** Deadline for one HTTP request (not for the publish as a whole). */
+  httpTimeoutSeconds: number;
+  /** Fetch the share URL and the model after publishing, to prove they serve. */
+  verifyAfterPublish: boolean;
   maxModelBytes: number;
   warnModelBytes: number;
   /** Empty means "anywhere"; otherwise .FCStd/.glb arguments must live inside one. */
@@ -115,7 +135,6 @@ const FILE_KEYS = new Set<string>(
     'apiUrl',
     'siteUrl',
     'outputsFile',
-    'publishScript',
     'exportScript',
     'freecadcmd',
     'workDir',
@@ -124,6 +143,8 @@ const FILE_KEYS = new Set<string>(
     'defaultAngularDeflection',
     'freecadTimeoutSeconds',
     'publishTimeoutSeconds',
+    'httpTimeoutSeconds',
+    'verifyAfterPublish',
     'maxModelBytes',
     'warnModelBytes',
     'allowedPaths',
@@ -274,6 +295,18 @@ export function loadConfig(opts: LoadOptions = {}): LoadedConfig {
   if (env.THREED_CONFIG && fileRaw === undefined) {
     throw new ConfigError(`THREED_CONFIG points at ${configFile}, which does not exist`);
   }
+  for (const [key, removed] of Object.entries(REMOVED_KEYS)) {
+    if (key in file) {
+      throw new ConfigError(`${configFile}: ${key} is no longer a setting — ${removed.why}. Delete it.`);
+    }
+    if (env[removed.envName]) {
+      throw new ConfigError(
+        `${removed.envName} is no longer a setting — ${removed.why}. ` +
+          "Remove it from the server's env block.",
+      );
+    }
+  }
+
   const unknown = Object.keys(file).filter((k) => !isCommentKey(k) && !FILE_KEYS.has(k));
   if (unknown.length) {
     throw new ConfigError(
@@ -360,9 +393,6 @@ export function loadConfig(opts: LoadOptions = {}): LoadedConfig {
       def: () => null,
     }),
 
-    publishScript: pick('publishScript', 'THREED_PUBLISH_SCRIPT', asPath, {
-      def: () => path.join(repoRoot, 'tools', 'publish.sh'),
-    }),
     exportScript: pick('exportScript', 'THREED_EXPORT_SCRIPT', asPath, {
       def: () => path.join(repoRoot, 'tools', 'freecad_export_glb.py'),
     }),
@@ -401,6 +431,17 @@ export function loadConfig(opts: LoadOptions = {}): LoadedConfig {
       (raw, where) => parseNumber(raw, where, { min: 1 }),
       { def: () => 120 },
     ),
+    // Per request, so a stalled connection fails in seconds while the publish as
+    // a whole still gets its full publishTimeoutSeconds of polling.
+    httpTimeoutSeconds: pick(
+      'httpTimeoutSeconds',
+      'THREED_HTTP_TIMEOUT_SECONDS',
+      (raw, where) => parseNumber(raw, where, { min: 1 }),
+      { def: () => 30 },
+    ),
+    verifyAfterPublish: pick('verifyAfterPublish', 'THREED_VERIFY_PUBLISH', parseBoolean, {
+      def: () => true,
+    }),
 
     maxModelBytes: pick(
       'maxModelBytes',
@@ -511,6 +552,23 @@ export function resolveUserPath(
     );
   }
   return resolved;
+}
+
+/**
+ * The project a call is about: its own argument, else the configured default.
+ *
+ * Validated with the Lambda's own `normalizeSlug`, so a slug this server accepts
+ * is one the API accepts, and a reserved name is refused here with the same
+ * message rather than after a round trip.
+ */
+export function resolveProject(cfg: Config, project?: string | null): string {
+  const wanted = project ?? cfg.defaultProject ?? '';
+  if (!String(wanted).trim()) {
+    throw new BadRequest(
+      'project is required (or set THREED_DEFAULT_PROJECT / defaultProject in the config file)',
+    );
+  }
+  return normalizeSlug(wanted);
 }
 
 /** Prefix containment that respects path boundaries (/a/bc is not inside /a/b). */

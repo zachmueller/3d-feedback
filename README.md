@@ -95,10 +95,18 @@ tools/publish.sh model.glb --project towel-clip \
 # … prints https://3d.zach.nz/towel-clip/4
 ```
 
-The script signs `POST /publish` with your AWS credentials (resolved through
-`aws configure export-credentials`, so SSO and assumed roles work), which
-reserves the next revision and returns a presigned `PUT`; it uploads the file,
-polls `status/<proj>/<rev>.json`, and prints the URL as its only stdout line:
+`publish.sh` is a wrapper: the publish itself is
+[tools/mcp/publish.ts](tools/mcp/publish.ts), which the MCP server below calls
+in-process. One implementation of reserve → upload → wait → verify, rather than a
+shell script and a server that have to agree — which is also why publishing needs
+no `jq`, no `curl` and not even the AWS CLI. Credentials come from the AWS SDK's
+provider chain (the same profiles, assumed roles and `aws sso login` cache the CLI
+uses; only a profile *name* is ever configured) and the request is signed in
+process.
+
+It signs `POST /publish`, which reserves the next revision and returns a presigned
+`PUT`; it uploads the file, polls `status/<proj>/<rev>.json`, checks that the
+finished URL actually serves, and prints the URL as its only stdout line:
 
 ```bash
 URL=$(tools/publish.sh model.glb --project towel-clip --quiet)
@@ -110,6 +118,31 @@ capture stdout.
 Endpoints are read from `--api-url`/`--site-url`, then `THREED_API_URL`/
 `THREED_SITE_URL`, then `cdk-outputs.json`. Deploy with
 `--outputs-file cdk-outputs.json` and the flags become unnecessary.
+
+### Retrying without spending a revision
+
+Numbers are never reused, so a retry is the one thing a publisher must not do
+naïvely. Two mechanisms make it safe, and both are in `POST /publish` rather than
+in the client, so every caller gets them:
+
+- **Identical bytes are recognised.** Every publish declares a sha256 of the file.
+  If it matches the *latest* ready revision, the API returns that revision and
+  reserves nothing — so a retry after a lost response, or a re-run of the same
+  workflow, is a no-op that prints the same URL. `--force` publishes anyway. Only
+  the latest revision is compared: re-publishing the geometry of an older revision
+  is a deliberate revert and deserves its own number.
+- **A reserved revision can be finished.** When a publish dies after reserving —
+  the upload failed, the processor rejected the file, the wait ran out —
+  `--revision N` re-presigns an upload for that same number instead of taking a
+  new one. The failure message names the number and the exact command. Refused
+  once the revision is `ready`: its model is served with a one-year immutable
+  cache, so replacing the bytes under a URL that has been shared would leave the
+  CDN serving the old ones.
+
+`contentHash` is an idempotency key, not an integrity check — the publisher hashes
+the exact bytes it uploads, and TLS and S3's own checksums cover the transfer, so
+nothing re-reads a 100 MB model to confirm it. It is kept in the private index
+only; the public manifest still carries just what the viewer renders.
 
 ## Exporting from FreeCAD
 
@@ -157,16 +190,20 @@ and rejects `.gltf`, `.stl` and `.step` with a message saying so.
 
 ## MCP server
 
-[tools/mcp/](tools/mcp/) is a stdio MCP server that hands the whole path —
-FreeCAD document → `.glb` → revision URL — to another AI harness, so it does not
-have to rediscover the parts that are not guessable: that `freecadcmd` is not on
-PATH, that the exporter needs a `--` separator, that only `.glb` is accepted, what
-`ref_` means, which AWS profile signs the publish, or that revision numbers are
-burned permanently even by a throwaway publish.
+[tools/mcp/](tools/mcp/) is a stdio MCP server that hands the whole loop — FreeCAD
+document → `.glb` → revision URL → the feedback that comes back — to another AI
+harness, so it does not have to rediscover the parts that are not guessable: that
+`freecadcmd` is not on PATH, that the exporter needs a `--` separator, that only
+`.glb` is accepted, what `ref_` means, which AWS profile signs the publish, that
+revision numbers are burned permanently even by a throwaway publish, or which of
+the site's objects can be read without credentials.
+
+The directory holds the publish client too, not just the server: `tools/publish.sh`
+runs [cli.ts](tools/mcp/cli.ts) over the same code.
 
 ```bash
 npm run mcp          # run it (stdio; a harness normally spawns this)
-npm run mcp:smoke    # handshake + check_setup + inspect_glb over real stdio
+npm run mcp:smoke    # handshake + check_setup + inspect_glb + a site read, over real stdio
 npm run mcp:check    # typecheck
 ```
 
@@ -185,20 +222,34 @@ Register it by pointing the harness at the same command:
 }
 ```
 
-Six tools:
+Ten tools. Six write or export; four only read, and those four need no credentials
+at all — the manifests, comment threads and status objects they read are the same
+public objects the viewer reads, straight off the distribution.
 
 | Tool | Does |
 |---|---|
-| `check_setup` | Effective config (and which layer each value came from) plus a read-only health check: FreeCAD binary, `aws`/`jq`/`curl --aws-sigv4`, resolved endpoints, and whether the profile has live credentials **for the deployment's own account** — it compares `sts get-caller-identity` against the account in the `PublishRouteArn` output, because an ambient `AWS_PROFILE` pointing elsewhere otherwise shows up only as an opaque 403. Names the fix for each failure. |
+| `check_setup` | Effective config (and which layer each value came from) plus a read-only health check: FreeCAD binary, resolved endpoints, whether the site answers, and whether the profile has live credentials **for the deployment's own account** — it compares `GetCallerIdentity` against the account in the `PublishRouteArn` output, because an ambient `AWS_PROFILE` pointing elsewhere otherwise shows up only as an opaque 403. Names the fix for each failure. |
 | `export_glb` | Headless `freecadcmd` export of a **saved** `.FCStd`, then reports the parts panel it produced |
 | `gui_export_instructions` | The `exec()` snippet to run in an already-open FreeCAD (freecad-mcp), which keeps per-face colours and exports the live document |
 | `inspect_glb` | Local check: parts-panel prediction, `ref_` parts, triangle counts, would the processor accept it |
-| `publish_model` | Publish an existing `.glb` as the next revision; returns the share URL |
+| `publish_model` | Publish an existing `.glb` as the next revision; returns the share URL. Identical bytes return the existing revision; `revision` finishes one that was already reserved |
 | `convert_and_publish` | Export → inspect → publish in one call |
+| `list_revisions` | What a reviewer can see: title, latest, every published revision with its notes, size, comment count and URL |
+| `get_publish_status` | Whether a publish landed — `ready` with the URL, `error` with the processor's reason, or still `processing`. The tool for a publish whose wait timed out |
+| `get_feedback` | The comments on one revision, or across the project, newest first |
+| `verify_revision` | Fetch the share page and the model as a reviewer would: status, content type, immutable caching, and that the size served matches the manifest |
 
-Editing and deleting are deliberately absent: those routes are Cognito-only
-(`/admin`), and a headless server cannot complete a Google sign-in. Publishing
-works because `POST /publish` is SigV4 — see the auth table above.
+Editing, deleting and listing *every* project are deliberately absent: those routes
+are Cognito-only (`/admin`), and a headless server cannot complete a Google
+sign-in. Publishing works because `POST /publish` is SigV4, and the read tools work
+because what they read is public — see the auth table above.
+
+A `ready` status and a working URL are different claims, which is why
+`verify_revision` exists and why publishing ends with it (`verifyAfterPublish`).
+The status object is written by the processor from inside AWS; between it and a
+reviewer sit the distribution, its origin access control, the certificate and DNS.
+A failed check is reported loudly but does not turn a successful publish into an
+error — the revision exists either way, and saying otherwise invites a second one.
 
 The parts prediction in `inspect_glb` mirrors `viewer-app/viewer.js`, so it
 answers "will the reviewer see the checkboxes I expect?" without a publish.
@@ -223,7 +274,6 @@ lists them all). Precedence, reported per key by `check_setup`:
 | `THREED_OUTPUTS_FILE` | `outputsFile` | `cdk-outputs.json` |
 | `THREED_CONFIG` | — | `tools/mcp/config.json` |
 | `THREED_REPO_ROOT` | — | resolved from the server's own path |
-| `THREED_PUBLISH_SCRIPT` | `publishScript` | `tools/publish.sh` |
 | `THREED_EXPORT_SCRIPT` | `exportScript` | `tools/freecad_export_glb.py` |
 | `THREED_FREECADCMD` | `freecadcmd` | PATH, then `/Applications/FreeCAD.app/…/freecadcmd` |
 | `THREED_WORK_DIR` | `workDir` | `$TMPDIR/3d-feedback` |
@@ -231,21 +281,25 @@ lists them all). Precedence, reported per key by `check_setup`:
 | `THREED_DEFAULT_LINEAR_DEFLECTION` | `defaultLinearDeflection` | FreeCAD's 0.5 |
 | `THREED_DEFAULT_ANGULAR_DEFLECTION` | `defaultAngularDeflection` | FreeCAD's 28.5 |
 | `THREED_FREECAD_TIMEOUT_SECONDS` | `freecadTimeoutSeconds` | 300 |
-| `THREED_PUBLISH_TIMEOUT_SECONDS` | `publishTimeoutSeconds` | 120 |
+| `THREED_PUBLISH_TIMEOUT_SECONDS` | `publishTimeoutSeconds` | 120 (how long to wait for the processor) |
+| `THREED_HTTP_TIMEOUT_SECONDS` | `httpTimeoutSeconds` | 30 (per request, not per publish) |
+| `THREED_VERIFY_PUBLISH` | `verifyAfterPublish` | `true`; fetch the URL and the model after publishing |
 | `THREED_MAX_MODEL_BYTES` | `maxModelBytes` | 100 MB (the Lambda's own cap) |
 | `THREED_WARN_MODEL_BYTES` | `warnModelBytes` | 25 MB (advisory) |
 | `THREED_ALLOWED_PATHS` | `allowedPaths` | anywhere; `:`-separated roots confine it |
-| `THREED_ALLOW_PUBLISH` | `allowPublish` | `true`; `false` unregisters the publishing tools |
-| `THREED_DRY_RUN` | `dryRun` | `false`; exports for real, reports the publish command instead of running it |
+| `THREED_ALLOW_PUBLISH` | `allowPublish` | `true`; `false` unregisters the publishing tools, leaving the read-only ones |
+| `THREED_DRY_RUN` | `dryRun` | `false`; exports for real, reports the request it would send instead of sending it |
 | `THREED_ENABLED_TOOLS` | `enabledTools` | all; a comma list narrows the surface |
 | `THREED_LOG_LEVEL` | `logLevel` | `info` (stderr) |
 | `THREED_LOG_FILE` | `logFile` | none |
 
-No credentials are configured here, only a profile *name*: publishing shells out
-to `publish.sh`, which resolves them with `aws configure export-credentials`. An
-unknown key or an unparseable value stops the server with a message rather than
-being silently ignored — the exception is `cdk-outputs.json`, which is tolerated
-when broken (the export tools do not need it) and reported by `check_setup`.
+No credentials are configured here, only a profile *name*: the AWS SDK's provider
+chain resolves it the way the CLI does, including the SSO cache that
+`aws sso login` writes. An unknown key or an unparseable value stops the server
+with a message rather than being silently ignored, and a key that used to exist
+(`publishScript`) says what replaced it instead of appearing among the typos. The
+exception is `cdk-outputs.json`, which is tolerated when broken (the export tools
+do not need it) and reported by `check_setup`.
 
 Because stdout carries JSON-RPC, every child process is captured rather than
 inherited and all logging goes to stderr; `npm run mcp:smoke` fails if anything
@@ -352,11 +406,11 @@ in a second pass.
 | `lib/cloudfront-functions/` | Viewer-request URL rewriting |
 | `viewer-app/` | Public viewer SPA (three.js, no build step) |
 | `admin-app/` | Admin SPA (Google PKCE, no build step) |
-| `tools/publish.sh` | Publish a revision, print the share URL |
+| `tools/publish.sh` | Publish a revision, print the share URL (a wrapper over `tools/mcp/cli.ts`) |
 | `tools/parent-dns.sh` | The subdomain's records in the parent `zach.nz` zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
 | `tools/freecad_selftest.py` | Exporter selection rules, against a fixture document |
-| `tools/mcp/` | stdio MCP server: export, inspect, publish, for other AI harnesses |
+| `tools/mcp/` | stdio MCP server *and* the publish client both entry points share: export, inspect, publish, read back |
 | `scripts/` | three.js vendoring, sample model, dev server, MCP stdio smoke test |
 | `test/` | Stack assertions + handler, edge-function and MCP units |
 
@@ -372,7 +426,12 @@ in a second pass.
   cleaned up by deleting the revision or the project.
 - The admin app cannot be exercised locally — Cognito sign-in needs the deployed
   Hosted UI.
-- The MCP server publishes but cannot list, edit, delete or read feedback: those
-  routes need a Cognito JWT from a Google sign-in, which a headless server has no
-  way to complete. Adding them would mean IAM-authorised variants of those routes
-  in the stack.
+- The MCP server publishes and reads, but cannot list *every* project, edit notes
+  or delete anything: those routes need a Cognito JWT from a Google sign-in, which
+  a headless server has no way to complete. Reading works only because the
+  viewer's own objects are public, so every read starts from a slug you already
+  know. Adding the rest would mean IAM-authorised variants of those routes in the
+  stack.
+- Reads go through a 5-second CDN cache (10s max), so a comment or a manifest can
+  lag by that much; CloudFront does not honour a `cache-control: no-cache` request
+  header from the viewer. Publishing accounts for it in its polling deadline.

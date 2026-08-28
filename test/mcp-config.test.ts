@@ -45,10 +45,15 @@ const writeConfig = (contents: unknown): string => {
 describe('defaults', () => {
   it('hangs the script and outputs paths off the repo root', () => {
     const { values, sources } = load();
-    expect(values.publishScript).toBe(path.join(dir, 'tools', 'publish.sh'));
     expect(values.exportScript).toBe(path.join(dir, 'tools', 'freecad_export_glb.py'));
     expect(values.outputsFile).toBe(path.join(dir, 'cdk-outputs.json'));
-    expect(sources.publishScript).toBe('default');
+    expect(sources.exportScript).toBe('default');
+  });
+
+  it('verifies after publishing, with a per-request deadline', () => {
+    const { values } = load();
+    expect(values.verifyAfterPublish).toBe(true);
+    expect(values.httpTimeoutSeconds).toBe(30);
   });
 
   it('defaults the region to us-east-1 and reports no endpoints', () => {
@@ -125,6 +130,17 @@ describe('rejecting bad configuration', () => {
   it('names an unknown config-file key instead of ignoring it', () => {
     expect(() => load({ THREED_CONFIG: writeConfig({ awsProfle: 'typo' }) })).toThrow(ConfigError);
     expect(() => load({ THREED_CONFIG: writeConfig({ awsProfle: 'typo' }) })).toThrow(/awsProfle/);
+  });
+
+  // A setting that was real last week deserves better than being listed among
+  // typos: the message has to say what replaced it.
+  it('explains a setting that no longer exists, in the file and in the env', () => {
+    expect(() => load({ THREED_CONFIG: writeConfig({ publishScript: '/old/publish.sh' }) })).toThrow(
+      /publishScript is no longer a setting.*publish\.sh/s,
+    );
+    expect(() => load({ THREED_PUBLISH_SCRIPT: '/old/publish.sh' })).toThrow(
+      /THREED_PUBLISH_SCRIPT is no longer a setting/,
+    );
   });
 
   it('accepts _-prefixed comment keys', () => {
@@ -224,6 +240,10 @@ describe('the tool surface', () => {
     expect(tools).not.toContain('publish_model');
     expect(tools).not.toContain('convert_and_publish');
     expect(tools).toContain('inspect_glb');
+    // The read tools write nothing, so a read-only harness keeps them.
+    expect(tools).toEqual(
+      expect.arrayContaining(['list_revisions', 'get_publish_status', 'get_feedback', 'verify_revision']),
+    );
   });
 
   it('narrows to enabledTools, and still honours allowPublish', () => {

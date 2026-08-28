@@ -1,35 +1,42 @@
 /**
- * Publish a .glb by shelling out to tools/publish.sh.
+ * The publish protocol, in this process: reserve → upload → wait → verify.
  *
- * Not reimplemented here on purpose. That script already reserves the revision
- * with a SigV4-signed `POST /publish`, resolves credentials through
- * `aws configure export-credentials` (so SSO and assumed roles work), uploads to
- * the presigned PUT, polls `status/<project>/<rev>.json`, and prints the share URL
- * as the only thing on stdout — it was written as an automation entry point, and
- * a second implementation would be a second thing to keep correct.
+ * This used to shell out to tools/publish.sh, which needed bash, the AWS CLI, jq
+ * and a curl new enough for --aws-sigv4. Four binaries had to be present for the
+ * last step of an export to work, and when one wasn't, the failure arrived as
+ * scraped stderr with the share URL recovered from stdout by regex. The script is
+ * now a wrapper around this file (see cli.ts), so there is still one implementation
+ * — it just lives where the errors are objects.
  *
- * Everything it needs is passed explicitly (`--profile`, `--region`, `--api-url`,
- * `--site-url`, `--timeout`) rather than inherited from the environment, because
- * an MCP server is spawned by a harness whose environment nobody is looking at.
+ * What the protocol needs a client to know, none of which is guessable:
+ *
+ *  - `POST /publish` reserves a revision number *before* the upload, and numbers
+ *    are never reused. A client that retries blindly spends them. So every publish
+ *    declares a sha256 of its bytes: if it matches the latest revision the API
+ *    hands that one back instead of reserving anything (`deduped`), and a publish
+ *    that died after reserving can be finished with `revision: N` (`resumed`)
+ *    rather than leaving a gap.
+ *  - The share URL is known before the model exists, so it is returned early and
+ *    readiness is polled from `status/<slug>/<rev>.json`.
+ *  - A `ready` status means the processor copied the model, not that a reviewer
+ *    can load it; verification (site.ts) is what answers that.
  */
-import { execFile } from 'child_process';
+import { createHash } from 'crypto';
 import * as fs from 'fs';
-import { promisify } from 'util';
+import * as path from 'path';
 
-// Slug rules, text sanitising and field caps come from the Lambda that will
-// receive this request, so a bad argument is rejected here with the same message
-// the API would have used.
-import {
-  BadRequest,
-  MAX_NOTES_LEN,
-  MAX_TITLE_LEN,
-  normalizeSlug,
-  optionalText,
-} from '../../lib/lambda/handler';
+// Text caps and sanitising come from the Lambda that will receive this request, so
+// a bad argument is rejected here with the message the API would have used.
+import { BadRequest, MAX_NOTES_LEN, MAX_TITLE_LEN, optionalText } from '../../lib/lambda/handler';
 
-import { type Config, PathError, resolveUserPath } from './config';
+import { signHeaders } from './aws';
+import { type Config, PathError, resolveProject, resolveUserPath } from './config';
+import { errorDetail, type FetchLike, type HttpResult, nodeFetch, parseJson, request } from './http';
+import { siteReader, type StatusObject, verifyRevision, type VerifyReport } from './site';
 
-const execFileAsync = promisify(execFile);
+// --- shape -------------------------------------------------------------------
+
+export type PublishStage = 'reserve' | 'upload' | 'process' | 'verify';
 
 export interface PublishRequest {
   glb: string;
@@ -37,137 +44,484 @@ export interface PublishRequest {
   title?: string;
   notes?: string;
   timeoutSeconds?: number;
+  /** Finish a revision that was already reserved, instead of taking a new number. */
+  revision?: number;
+  /** Publish even if these exact bytes are already the latest revision. */
+  force?: boolean;
+  /** Overrides the configured verifyAfterPublish. */
+  verify?: boolean;
 }
 
 export interface PublishResult {
   project: string;
+  /** null only for a dry run, which reserves nothing. */
   revision: number | null;
   url: string;
   bytes: number;
-  /** The command that ran (or would run, when dryRun is set). */
-  command: string;
+  contentHash: string;
+  /** The API recognised these bytes: no revision was spent and nothing uploaded. */
+  deduped: boolean;
+  /** This call finished an already-reserved revision. */
+  resumed: boolean;
   dryRun: boolean;
-  /** publish.sh's progress output, for the record. */
-  log: string;
-}
-
-/** Pull the revision back out of a share URL: https://host/<slug>/<rev> */
-export function parseShareUrl(url: string): { project: string; revision: number } | null {
-  const match = /^https?:\/\/[^/]+\/([a-z0-9][a-z0-9-]*)\/(\d+)\/?$/.exec(url.trim());
-  return match ? { project: match[1], revision: Number(match[2]) } : null;
-}
-
-const shellQuote = (arg: string): string =>
-  /^[A-Za-z0-9_./:=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
-
-/** The publish.sh argument list, assembled from config plus the request. */
-export function publishArgs(cfg: Config, req: PublishRequest, glb: string, project: string): string[] {
-  const args = [cfg.publishScript, glb, '--project', project];
-
-  const title = optionalText(req.title, MAX_TITLE_LEN);
-  if (title) args.push('--title', title);
-  const notes = optionalText(req.notes, MAX_NOTES_LEN);
-  if (notes) args.push('--notes', notes);
-
-  if (cfg.awsProfile) args.push('--profile', cfg.awsProfile);
-  args.push('--region', cfg.awsRegion);
-  if (cfg.apiUrl) args.push('--api-url', cfg.apiUrl);
-  if (cfg.siteUrl) args.push('--site-url', cfg.siteUrl);
-  args.push('--timeout', String(Math.round(req.timeoutSeconds ?? cfg.publishTimeoutSeconds)));
-  return args;
+  /** What each stage did, retries included. */
+  log: string[];
+  verification: VerifyReport | null;
+  /** For a dry run: the request that would have been signed and sent. */
+  plannedRequest?: { url: string; body: Record<string, unknown> };
 }
 
 /**
- * Reserve a revision, upload, and wait for the processor.
+ * A publish that failed, and what can be done about it.
  *
- * `dryRun` stops after assembling the command, which is how a harness can
- * exercise the whole path — including the export and the local checks — without
- * creating a revision. Revision numbers are never reused, so a throwaway publish
- * burns one permanently.
+ * `reservedRevision` is the part that matters: once a number is reserved it is
+ * spent whatever happens next, so the difference between "retry this revision"
+ * and "publish again" is the difference between a gap in the numbering and none.
  */
-export async function publishModel(cfg: Config, req: PublishRequest): Promise<PublishResult> {
+export class PublishError extends Error {
+  readonly stage: PublishStage;
+  readonly status: number | null;
+  readonly project: string;
+  readonly reservedRevision: number | null;
+
+  constructor(opts: {
+    stage: PublishStage;
+    detail: string;
+    project: string;
+    glb: string;
+    status?: number | null;
+    reservedRevision?: number | null;
+    /** How to say "retry this revision" in the caller's own interface. */
+    hint?: string[];
+  }) {
+    const lines = [`Publishing failed at the ${opts.stage} stage: ${opts.detail}`];
+    if (opts.reservedRevision !== null && opts.reservedRevision !== undefined) {
+      lines.push(
+        '',
+        `Revision ${opts.reservedRevision} of "${opts.project}" is reserved but unfinished. ` +
+          'Retry it without spending another number:',
+        ...(opts.hint ?? []),
+      );
+    }
+    super(lines.join('\n'));
+    this.name = 'PublishError';
+    this.stage = opts.stage;
+    this.status = opts.status ?? null;
+    this.project = opts.project;
+    this.reservedRevision = opts.reservedRevision ?? null;
+  }
+}
+
+/** Injected so the retry, polling and recovery rules are testable offline. */
+export interface PublishDeps {
+  fetch: FetchLike;
+  sign: typeof signHeaders;
+  sleep: (ms: number) => Promise<void>;
+  now: () => number;
+  /**
+   * How to phrase "retry this revision" for whoever is reading the error. The MCP
+   * server's caller makes tool calls; the CLI's runs a shell command. Advice in the
+   * wrong dialect is advice that gets ignored, and ignoring it costs a revision.
+   */
+  resumeHint: (opts: { glb: string; project: string; revision: number }) => string[];
+}
+
+const defaultDeps: PublishDeps = {
+  fetch: nodeFetch,
+  sign: signHeaders,
+  sleep: (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+  now: () => Date.now(),
+  resumeHint: ({ glb, project, revision }) => [
+    `  publish_model({ glb: "${glb}", project: "${project}", revision: ${revision} })`,
+    `Or check on it first: get_publish_status({ project: "${project}", revision: ${revision} })`,
+  ],
+};
+
+/** How often the status object is polled. The API writes it before responding. */
+const POLL_INTERVAL_MS = 2000;
+const MAX_ATTEMPTS = 3;
+
+// --- pure rules --------------------------------------------------------------
+
+/**
+ * Whether a failed request is worth repeating. `status: 0` is "no response at
+ * all" from http.ts — a timeout, a reset, a DNS failure — which is the most
+ * retryable thing there is. A 4xx other than 429 is the caller's fault and will
+ * fail again identically; retrying it only delays the message.
+ */
+export function shouldRetry(status: number, attempt: number, maxAttempts = MAX_ATTEMPTS): boolean {
+  if (attempt >= maxAttempts) return false;
+  return status === 0 || status === 429 || status >= 500;
+}
+
+/** 250ms, 500ms, 1s… capped, deterministic — one publish is not a thundering herd. */
+export const backoffMs = (attempt: number): number => Math.min(4000, 250 * 2 ** (attempt - 1));
+
+/**
+ * A presigned PUT that outlived its 15 minutes. Recoverable without spending a
+ * revision: ask for a fresh URL for the same reserved number. Worth detecting
+ * separately because S3 reports it as a plain 403, which otherwise reads as a
+ * permissions problem.
+ */
+export function isExpiredUpload(result: HttpResult): boolean {
+  return result.status === 403 && /expired/i.test(result.body);
+}
+
+/** The body of POST /publish. */
+export function publishBody(
+  req: PublishRequest,
+  project: string,
+  filename: string,
+  contentHash: string,
+): Record<string, unknown> {
+  const title = optionalText(req.title, MAX_TITLE_LEN);
+  const notes = optionalText(req.notes, MAX_NOTES_LEN);
+  return {
+    project,
+    filename,
+    contentHash,
+    ...(title ? { title } : {}),
+    ...(notes ? { notes } : {}),
+    ...(req.force ? { force: true } : {}),
+    ...(req.revision === undefined ? {} : { revision: req.revision }),
+  };
+}
+
+/** What POST /publish answers with. */
+interface ReserveResponse {
+  project: string;
+  revision: number;
+  url: string;
+  statusUrl?: string;
+  uploadUrl?: string;
+  key?: string;
+  deduped?: boolean;
+  resumed?: boolean;
+  message?: string;
+}
+
+// --- stages ------------------------------------------------------------------
+
+async function reserve(
+  cfg: Config,
+  deps: PublishDeps,
+  req: PublishRequest,
+  body: Record<string, unknown>,
+  log: string[],
+): Promise<ReserveResponse> {
+  const url = `${cfg.apiUrl}/publish`;
+  const payload = JSON.stringify(body);
+  const timeoutMs = Math.round(cfg.httpTimeoutSeconds * 1000);
+  const project = String(body.project);
+
+  for (let attempt = 1; ; attempt++) {
+    const headers = await deps.sign({
+      method: 'POST',
+      url,
+      body: payload,
+      region: cfg.awsRegion,
+      profile: cfg.awsProfile,
+      headers: { 'content-type': 'application/json' },
+    });
+    const result = await request(deps.fetch, url, { method: 'POST', headers, body: payload }, timeoutMs);
+
+    if (result.status === 200) {
+      const parsed = parseJson<ReserveResponse>(result.body);
+      if (!parsed || typeof parsed.revision !== 'number') {
+        throw new PublishError({
+          stage: 'reserve',
+          detail: `the API answered 200 with something that is not a publish response: ${result.body.slice(0, 300)}`,
+          project,
+          glb: req.glb,
+        });
+      }
+      return parsed;
+    }
+
+    if (shouldRetry(result.status, attempt)) {
+      const wait = backoffMs(attempt);
+      log.push(
+        `reserve attempt ${attempt} failed (${describe(result)}); retrying in ${wait}ms`,
+      );
+      await deps.sleep(wait);
+      continue;
+    }
+
+    throw new PublishError({
+      stage: 'reserve',
+      status: result.status || null,
+      detail:
+        result.status === 403
+          ? `${describe(result)} — the IAM authorizer rejected the signature. Run check_setup: ` +
+            'live credentials for the wrong account look exactly like this.'
+          : describe(result),
+      project,
+      glb: req.glb,
+    });
+  }
+}
+
+async function upload(
+  cfg: Config,
+  deps: PublishDeps,
+  bytes: Buffer,
+  uploadUrl: string,
+  log: string[],
+  refresh: () => Promise<string>,
+): Promise<void> {
+  // Long enough for the bytes themselves: a 100 MB model on a slow uplink would
+  // blow the per-request timeout that the JSON calls use.
+  const timeoutMs = Math.max(Math.round(cfg.publishTimeoutSeconds * 1000), 60_000);
+  let url = uploadUrl;
+  let refreshed = false;
+
+  for (let attempt = 1; ; attempt++) {
+    const result = await request(
+      deps.fetch,
+      url,
+      { method: 'PUT', body: bytes, headers: { 'content-length': String(bytes.length) } },
+      timeoutMs,
+    );
+    if (result.status === 200) return;
+
+    // An expired URL is not a retry of the same request; it needs a new one.
+    if (isExpiredUpload(result) && !refreshed) {
+      log.push('the presigned upload URL had expired; asking for a fresh one');
+      url = await refresh();
+      refreshed = true;
+      continue;
+    }
+
+    if (shouldRetry(result.status, attempt)) {
+      const wait = backoffMs(attempt);
+      log.push(`upload attempt ${attempt} failed (${describe(result)}); retrying in ${wait}ms`);
+      await deps.sleep(wait);
+      continue;
+    }
+    throw new UploadFailed(describe(result), result.status || null);
+  }
+}
+
+/** Internal: carries the reason up to where the reserved revision is known. */
+class UploadFailed extends Error {
+  constructor(
+    readonly detail: string,
+    readonly status: number | null,
+  ) {
+    super(detail);
+  }
+}
+
+/**
+ * Wait for the processor.
+ *
+ * Anything other than a readable, parseable status object is treated as "not yet"
+ * until the deadline: the object is written before POST /publish answers, but it is
+ * read back through a CDN with a 5-second TTL, so a moment of 404 or a stale body
+ * proves nothing. Only an explicit `error` status ends the wait early.
+ */
+async function waitForProcessing(
+  deps: PublishDeps,
+  statusUrl: string,
+  timeoutSeconds: number,
+  httpTimeoutMs: number,
+  log: string[],
+): Promise<StatusObject> {
+  const deadline = deps.now() + timeoutSeconds * 1000;
+  let polls = 0;
+  let lastProblem = 'it never reported a status';
+
+  for (;;) {
+    await deps.sleep(POLL_INTERVAL_MS);
+    polls++;
+    const result = await request(
+      deps.fetch,
+      statusUrl,
+      { method: 'GET', headers: { 'cache-control': 'no-cache' } },
+      httpTimeoutMs,
+    );
+    const status = result.status === 200 ? parseJson<StatusObject>(result.body) : null;
+
+    if (status?.status === 'ready') {
+      log.push(`processed after ${polls} poll${polls === 1 ? '' : 's'}`);
+      return status;
+    }
+    if (status?.status === 'error') {
+      throw new ProcessingFailed(status.error ?? 'the processor did not say why');
+    }
+    if (!status) lastProblem = `the status object was not readable (${describe(result)})`;
+    else lastProblem = `it was still ${status.status}`;
+
+    if (deps.now() >= deadline) {
+      throw new ProcessingFailed(
+        `gave up after ${timeoutSeconds}s — ${lastProblem}. The upload succeeded, so this is a ` +
+          'wait that ran out, not necessarily a failed publish.',
+      );
+    }
+  }
+}
+
+/** Internal, like UploadFailed: the reason, carried up to the reserved revision. */
+class ProcessingFailed extends Error {
+  constructor(readonly detail: string) {
+    super(detail);
+  }
+}
+
+const describe = (result: HttpResult): string =>
+  result.networkError ? result.networkError : `HTTP ${result.status}: ${errorDetail(result)}`;
+
+// --- the whole path ----------------------------------------------------------
+
+export async function publishModel(
+  cfg: Config,
+  req: PublishRequest,
+  overrides: Partial<PublishDeps> = {},
+): Promise<PublishResult> {
+  const deps = { ...defaultDeps, ...overrides };
+  const log: string[] = [];
+
   const glb = resolveUserPath(req.glb, cfg, { extensions: ['.glb'], label: 'glb' });
   if (!fs.existsSync(glb)) throw new PathError(`No such file: ${glb}`);
+  const project = resolveProject(cfg, req.project);
 
-  const wanted = req.project ?? cfg.defaultProject ?? '';
-  if (!String(wanted).trim()) {
-    throw new BadRequest(
-      'project is required (or set THREED_DEFAULT_PROJECT / defaultProject in the config file)',
-    );
-  }
-  const project = normalizeSlug(wanted);
-
-  if (!fs.existsSync(cfg.publishScript)) {
-    throw new Error(`publish.sh is missing: ${cfg.publishScript} (set THREED_PUBLISH_SCRIPT)`);
-  }
   if (!cfg.apiUrl) {
-    throw new Error(
+    throw new BadRequest(
       'No API URL. Deploy with `--outputs-file cdk-outputs.json`, or set THREED_API_URL ' +
         '(the deployed value is the ApiUrl stack output).',
     );
   }
 
-  const bytes = fs.statSync(glb).size;
-  const args = publishArgs(cfg, req, glb, project);
-  // publish.sh needs bash: `set -o pipefail` and arrays are not POSIX sh. Running
-  // it through bash also means it does not have to be executable.
-  const command = ['bash', ...args].map(shellQuote).join(' ');
+  // Read once and hash what will actually be uploaded — a second read could hash
+  // a file that changed in between, and the hash is what makes a retry safe.
+  const bytes = fs.readFileSync(glb);
+  const contentHash = createHash('sha256').update(bytes).digest('hex');
+  const filename = path.basename(glb);
+  const body = publishBody(req, project, filename, contentHash);
 
   if (cfg.dryRun) {
-    return { project, revision: null, url: '', bytes, command, dryRun: true, log: 'dry run: nothing was published' };
+    return {
+      project,
+      revision: null,
+      url: '',
+      bytes: bytes.length,
+      contentHash,
+      deduped: false,
+      resumed: false,
+      dryRun: true,
+      log: ['dry run: nothing was reserved, uploaded or published'],
+      verification: null,
+      plannedRequest: { url: `${cfg.apiUrl}/publish`, body },
+    };
   }
 
-  const timeoutSeconds = Math.round(req.timeoutSeconds ?? cfg.publishTimeoutSeconds);
-  let stdout = '';
-  let stderr = '';
-  try {
-    // Give the script 30s past its own polling deadline, so its "timed out
-    // waiting for processing" message wins over a blunt kill.
-    const res = await execFileAsync('bash', args, {
-      timeout: (timeoutSeconds + 30) * 1000,
-      maxBuffer: 4 * 1024 * 1024,
-      encoding: 'utf-8',
+  const reserved = await reserve(cfg, deps, req, body, log);
+
+  // A deployment that predates resume support ignores `revision` and reserves a
+  // new number instead. Say so, rather than let the caller believe a gap was avoided.
+  if (req.revision !== undefined && reserved.revision !== req.revision) {
+    throw new PublishError({
+      stage: 'reserve',
+      detail:
+        `asked to finish revision ${req.revision} but the API reserved ${reserved.revision} instead. ` +
+        'The deployment predates resume support — deploy the current handler ' +
+        '(`npx cdk deploy --outputs-file cdk-outputs.json`).',
+      project,
+      glb,
+      reservedRevision: reserved.revision,
     });
-    stdout = res.stdout;
-    stderr = res.stderr;
-  } catch (err: any) {
-    stdout = String(err?.stdout ?? '');
-    stderr = String(err?.stderr ?? '');
-    const detail = stderr.trim() || stdout.trim() || String(err?.message ?? err);
-    const statusHint = statusUrlFor(cfg, project, stderr);
-    throw new Error(
-      `Publishing failed.\n\n${detail}\n\nCommand: ${command}` +
-        (statusHint ? `\n\nCheck the revision's own status with:\n  curl -s ${statusHint}` : ''),
-    );
   }
 
-  const url = stdout.trim().split('\n').filter(Boolean).pop() ?? '';
-  const parsed = parseShareUrl(url);
-  if (!parsed) {
-    throw new Error(
-      `Publishing produced no share URL. publish.sh printed:\n${stdout.trim() || '(nothing)'}\n` +
-        `${stderr.trim()}\n\nCommand: ${command}`,
-    );
+  const deduped = reserved.deduped === true || !reserved.uploadUrl;
+  const resumed = reserved.resumed === true;
+  const revision = reserved.revision;
+  const statusUrl = reserved.statusUrl ?? `${cfg.siteUrl ?? ''}/status/${project}/${revision}.json`;
+
+  if (deduped) {
+    // What the client did, not what the API said — the caller-facing wording of
+    // "nothing was published" belongs to the summary, and saying it twice reads
+    // like two different things happened.
+    log.push('the API recognised the content hash: nothing uploaded, no number reserved');
+  } else {
+    if (resumed) log.push(`finishing already-reserved revision ${revision}`);
+    try {
+      await upload(cfg, deps, bytes, reserved.uploadUrl!, log, async () => {
+        const again = await reserve(cfg, deps, req, { ...body, revision }, log);
+        if (!again.uploadUrl) {
+          throw new Error('the API did not return a new upload URL');
+        }
+        return again.uploadUrl;
+      });
+    } catch (err) {
+      throw new PublishError({
+        stage: 'upload',
+        detail: err instanceof UploadFailed ? err.detail : err instanceof Error ? err.message : String(err),
+        status: err instanceof UploadFailed ? err.status : null,
+        project,
+        glb,
+        reservedRevision: revision,
+        hint: deps.resumeHint({ glb, project, revision }),
+      });
+    }
+
+    try {
+      await waitForProcessing(
+        deps,
+        statusUrl,
+        Math.round(req.timeoutSeconds ?? cfg.publishTimeoutSeconds),
+        Math.round(cfg.httpTimeoutSeconds * 1000),
+        log,
+      );
+    } catch (err) {
+      throw new PublishError({
+        stage: 'process',
+        detail: err instanceof ProcessingFailed ? err.detail : err instanceof Error ? err.message : String(err),
+        project,
+        glb,
+        reservedRevision: revision,
+        hint: deps.resumeHint({ glb, project, revision }),
+      });
+    }
+  }
+
+  // Verification is a report, not a gate: the revision exists either way, and a
+  // publish that is reported as failed because a CDN check flaked would send the
+  // caller looking in the wrong place.
+  let verification: VerifyReport | null = null;
+  if (req.verify ?? cfg.verifyAfterPublish) {
+    try {
+      const reader = siteReader(cfg, deps.fetch, siteUrlFrom(cfg, reserved.url));
+      // The size is checkable even for a dedupe: matching hashes mean the revision
+      // already there holds exactly these bytes.
+      verification = await verifyRevision(reader, project, revision, bytes.length);
+      if (!verification.ok) {
+        log.push('published, but verification found a problem — see the checks');
+      }
+    } catch (err) {
+      log.push(`could not verify the published revision: ${err instanceof Error ? err.message : String(err)}`);
+    }
   }
 
   return {
-    project: parsed.project,
-    revision: parsed.revision,
-    url,
-    bytes,
-    command,
+    project,
+    revision,
+    url: reserved.url,
+    bytes: bytes.length,
+    contentHash,
+    deduped,
+    resumed,
     dryRun: false,
-    log: stderr.trim(),
+    log,
+    verification,
   };
 }
 
-/**
- * The status object publish.sh polls, for a caller that wants to check on a
- * publish whose wait timed out. The revision is only knowable from the script's
- * own progress output, since it is assigned server-side.
- */
-function statusUrlFor(cfg: Config, project: string, stderr: string): string | null {
-  if (!cfg.siteUrl) return null;
-  const revision = /revision (\d+)/.exec(stderr)?.[1];
-  return revision ? `${cfg.siteUrl}/status/${project}/${revision}.json` : null;
+/** The configured site URL, else the origin of the share URL the API returned. */
+function siteUrlFrom(cfg: Config, shareUrl: string): string | null {
+  if (cfg.siteUrl) return cfg.siteUrl;
+  try {
+    return new URL(shareUrl).origin;
+  } catch {
+    return null;
+  }
 }
