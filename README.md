@@ -296,19 +296,24 @@ Set in `cdk.json`, or override in a gitignored `config.local.json`:
 | `threedHost:allowedEmails` | Comma-separated admin allowlist |
 | `threedHost:hostedUiPrefix` | Cognito Hosted-UI domain prefix (globally unique) |
 | `threedHost:domainName` | Custom domain (`3d.zach.nz`) |
-| `threedHost:domainEnabled` | `true` once the DNS delegation below exists |
+| `threedHost:domainEnabled` | `true` once the DNS records below exist in the parent zone |
 | `threedHost:googleClientId` | Google OAuth client id (blank ⇒ synth without Google) |
 | `threedHost:googleClientSecret` | Google OAuth client secret |
 
 With a blank Google client id the stack skips the Google IdP, and with
-`domainEnabled` false it skips the zone and certificate, so `synth` and the tests
-run with no secrets and no DNS.
+`domainEnabled` false it skips the certificate, so `synth` and the tests run with
+no secrets and no DNS.
 
 ## Deploying
 
-The subdomain's hosted zone lives in **this** account; the parent `zach.nz` zone
-lives in a separate `domains` account. Certificate validation cannot succeed
-until the parent delegates, so the domain is switched on in a second pass.
+`3d.zach.nz` is served straight from the parent `zach.nz` zone — one hosted zone
+for the whole domain, no delegated zone per app. That zone lives in a separate
+`domains` account, and CloudFormation cannot write records into another account's
+zone (nor can ACM's automatic DNS validation), so two records are created by
+`tools/parent-dns.sh` instead: the A/AAAA alias to the distribution and the ACM
+validation CNAME. Both are stable, so it is a one-time run — but the certificate
+cannot be issued until the validation record exists, so the domain is switched on
+in a second pass.
 
 1. **First deploy**, without the domain:
    ```bash
@@ -320,13 +325,14 @@ until the parent delegates, so the domain is switched on in a second pass.
    `GoogleRedirectUri` output as its authorized redirect URI. Put the id, secret
    and your allowlist in `config.local.json`, then deploy again.
 3. **Custom domain**: set `"threedHost:domainEnabled": "true"` and deploy. The
-   stack creates the zone and certificate, and CloudFormation then waits on DNS
-   validation — while it waits, delegate from the parent account:
+   stack requests the certificate and CloudFormation then waits on DNS
+   validation — while it waits, write the records into the parent zone:
    ```bash
-   tools/delegate-ns.sh --parent-profile domains
+   tools/parent-dns.sh --parent-profile domains
    ```
-   Validation completes, the alias records are created, and `3d.zach.nz` is live.
-   (Forget this step and the deploy eventually rolls back; delegate and re-run.)
+   Validation completes, and `3d.zach.nz` is live once the distribution finishes
+   updating. (Forget this step and the deploy eventually rolls back; write the
+   records and re-run — `--dry-run` first shows the change batch.)
 4. **Smoke test**:
    ```bash
    npm run sample-glb -- /tmp/sample.glb
@@ -347,7 +353,7 @@ until the parent delegates, so the domain is switched on in a second pass.
 | `viewer-app/` | Public viewer SPA (three.js, no build step) |
 | `admin-app/` | Admin SPA (Google PKCE, no build step) |
 | `tools/publish.sh` | Publish a revision, print the share URL |
-| `tools/delegate-ns.sh` | One-time NS delegation into the parent zone |
+| `tools/parent-dns.sh` | The subdomain's records in the parent `zach.nz` zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
 | `tools/freecad_selftest.py` | Exporter selection rules, against a fixture document |
 | `tools/mcp/` | stdio MCP server: export, inspect, publish, for other AI harnesses |

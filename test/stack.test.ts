@@ -220,29 +220,44 @@ describe('Cognito', () => {
 });
 
 describe('custom domain', () => {
-  it('is off by default, so a first deploy needs no DNS delegation', () => {
+  it('is off by default, so a first deploy needs no DNS at all', () => {
     const template = synth();
-    template.resourceCountIs('AWS::Route53::HostedZone', 0);
     template.resourceCountIs('AWS::CertificateManager::Certificate', 0);
+    template.resourceCountIs('AWS::Route53::HostedZone', 0);
     template.resourceCountIs('AWS::Route53::RecordSet', 0);
   });
 
-  it('creates the zone, a DNS-validated certificate and both alias records when enabled', () => {
+  it('creates a DNS-validated certificate and the distribution alias when enabled', () => {
     const template = synth({ 'threedHost:domainEnabled': 'true' });
-    template.hasResourceProperties('AWS::Route53::HostedZone', { Name: '3d.example.com.' });
     template.hasResourceProperties('AWS::CertificateManager::Certificate', {
       DomainName: '3d.example.com',
       ValidationMethod: 'DNS',
     });
-    template.resourceCountIs('AWS::Route53::RecordSet', 2);
     template.hasResourceProperties('AWS::CloudFront::Distribution', {
       DistributionConfig: { Aliases: ['3d.example.com'] },
     });
   });
 
-  it('publishes the name servers needed for the parent-zone delegation', () => {
-    const outputs = synth({ 'threedHost:domainEnabled': 'true' }).findOutputs('*');
-    expect(Object.keys(outputs)).toContain('DelegationNameServers');
+  // The records live in the parent zone, in another account, where neither
+  // CloudFormation nor ACM's automatic validation can reach them — they are
+  // written by tools/parent-dns.sh. Naming a hosted zone here would put the
+  // stack back in the business of owning a second zone.
+  it('owns no zone and no records, whether the domain is on or off', () => {
+    for (const template of [synth(), synth({ 'threedHost:domainEnabled': 'true' })]) {
+      template.resourceCountIs('AWS::Route53::HostedZone', 0);
+      template.resourceCountIs('AWS::Route53::RecordSet', 0);
+    }
+    synth({ 'threedHost:domainEnabled': 'true' }).hasResourceProperties(
+      'AWS::CertificateManager::Certificate',
+      { DomainValidationOptions: Match.absent() },
+    );
+  });
+
+  it('publishes the certificate whose validation record the parent zone must keep', () => {
+    const outputs = Object.keys(synth({ 'threedHost:domainEnabled': 'true' }).findOutputs('*'));
+    expect(outputs).toContain('CertificateArn');
+    expect(outputs).not.toContain('HostedZoneId');
+    expect(outputs).not.toContain('DelegationNameServers');
   });
 });
 

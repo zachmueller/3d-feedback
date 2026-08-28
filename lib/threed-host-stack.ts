@@ -6,7 +6,6 @@ import {
   RemovalPolicy,
   CfnOutput,
   SecretValue,
-  Fn,
 } from 'aws-cdk-lib';
 import { Construct } from 'constructs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
@@ -19,8 +18,6 @@ import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as cloudfront from 'aws-cdk-lib/aws-cloudfront';
 import * as origins from 'aws-cdk-lib/aws-cloudfront-origins';
 import * as acm from 'aws-cdk-lib/aws-certificatemanager';
-import * as route53 from 'aws-cdk-lib/aws-route53';
-import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as apigwv2 from 'aws-cdk-lib/aws-apigatewayv2';
 import { HttpLambdaIntegration } from 'aws-cdk-lib/aws-apigatewayv2-integrations';
 import {
@@ -62,11 +59,14 @@ export class ThreedHostStack extends Stack {
     const allowedEmails = this.ctx('threedHost:allowedEmails', 'you@example.com');
     const hostedUiPrefix = this.ctx('threedHost:hostedUiPrefix', 'threed-host-admin');
     const domainName = this.ctx('threedHost:domainName', '3d.zach.nz');
-    // The hosted zone for this subdomain lives in THIS account and is delegated
-    // from the parent zone (which lives in a separate `domains` account) by a
-    // one-time NS record — see tools/delegate-ns.sh. Until that delegation
-    // exists, DNS validation of the certificate cannot complete, so the domain
-    // is opt-in: deploy once with this false, delegate, then flip it to true.
+    // This subdomain is served straight from the parent `zach.nz` zone, which
+    // lives in a separate `domains` account — one zone for the whole domain
+    // instead of a delegated zone per app. CloudFormation cannot write records
+    // into another account's zone, and neither can ACM's automatic DNS
+    // validation, so tools/parent-dns.sh owns both records (the CloudFront alias
+    // and the ACM validation CNAME). Until the validation record exists the
+    // certificate cannot be issued, so the domain stays opt-in: deploy once with
+    // this false, write the records, then flip it to true.
     const domainEnabled = this.ctxBool('threedHost:domainEnabled', false);
     const googleClientId = this.ctx('threedHost:googleClientId', '');
     const googleClientSecret = this.ctx('threedHost:googleClientSecret', '');
@@ -136,26 +136,18 @@ export class ThreedHostStack extends Stack {
     });
 
     // =========================================================================
-    // Certificate + hosted zone (opt-in via threedHost:domainEnabled)
+    // Certificate (opt-in via threedHost:domainEnabled)
     // =========================================================================
-    let hostedZone: route53.PublicHostedZone | undefined;
     let certificate: acm.ICertificate | undefined;
     if (domainEnabled) {
-      // A zone for the subdomain itself, delegated from the parent zone in the
-      // `domains` account. Keeping the zone here means the cert's validation
-      // record and the alias records are all managed by this stack.
-      hostedZone = new route53.PublicHostedZone(this, 'HostedZone', {
-        zoneName: domainName,
-      });
-      // Retained ahead of the move to the parent zone: resolvers cache the
-      // parent's NS delegation for up to its TTL (48h), so this zone has to keep
-      // answering after the stack stops managing it. CloudFormation takes the
-      // deletion policy from the last template that contained the resource, so
-      // this must be deployed BEFORE the zone is removed from the stack.
-      hostedZone.applyRemovalPolicy(RemovalPolicy.RETAIN);
+      // No hosted zone is named, so CloudFormation waits on validation instead of
+      // recording it: the validation CNAME lives in the parent zone in the other
+      // account, put there by tools/parent-dns.sh. ACM reuses one validation
+      // token per domain per account, so the record is written once and keeps
+      // working for renewals and for any later re-request.
       certificate = new acm.Certificate(this, 'Certificate', {
         domainName,
-        validation: acm.CertificateValidation.fromDns(hostedZone),
+        validation: acm.CertificateValidation.fromDns(),
       });
     }
 
@@ -251,20 +243,9 @@ export class ThreedHostStack extends Stack {
     const siteDomain = domainEnabled ? domainName : cloudFrontDomain;
     const siteUrl = `https://${siteDomain}`;
 
-    if (hostedZone) {
-      const aliasTarget = route53.RecordTarget.fromAlias(
-        new targets.CloudFrontTarget(distribution),
-      );
-      const aliasA = new route53.ARecord(this, 'AliasA', { zone: hostedZone, target: aliasTarget });
-      const aliasAaaa = new route53.AaaaRecord(this, 'AliasAaaa', {
-        zone: hostedZone,
-        target: aliasTarget,
-      });
-      // Retained for the same reason as the zone: these are the answers a
-      // resolver holding the cached delegation still expects to find here.
-      aliasA.applyRemovalPolicy(RemovalPolicy.RETAIN);
-      aliasAaaa.applyRemovalPolicy(RemovalPolicy.RETAIN);
-    }
+    // The A/AAAA aliases pointing here live in the parent zone, in the other
+    // account: tools/parent-dns.sh --cf-domain / --stack reads this distribution's
+    // domain name and UPSERTs them.
 
     // =========================================================================
     // Cognito (user pool + Google IdP + Hosted UI + app client)
@@ -516,13 +497,10 @@ export class ThreedHostStack extends Stack {
     });
     new CfnOutput(this, 'StagingBucketName', { value: stagingBucket.bucketName });
     new CfnOutput(this, 'AssetsBucketName', { value: assetsBucket.bucketName });
-    if (hostedZone) {
-      new CfnOutput(this, 'HostedZoneId', { value: hostedZone.hostedZoneId });
-      new CfnOutput(this, 'DelegationNameServers', {
-        // Add these as the NS record for this subdomain in the parent zone
-        // (which lives in the `domains` account) — see tools/delegate-ns.sh.
-        value: Fn.join(',', hostedZone.hostedZoneNameServers ?? []),
-        description: 'NS records to add to the parent zone in the domains account',
+    if (certificate) {
+      new CfnOutput(this, 'CertificateArn', {
+        value: certificate.certificateArn,
+        description: 'Certificate whose validation CNAME must stay in the parent zone',
       });
     }
   }
