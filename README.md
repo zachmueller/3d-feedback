@@ -65,6 +65,46 @@ concurrency or a database.
 | `POST /list`, `/edit`, `/delete`, `/feedback` | Cognito JWT + email allowlist | Human admin, Google sign-in, allowlist re-checked per request |
 | `POST /comment` | none, throttled 5 rps | Reviewers comment without an account |
 
+### The two admin listings are paged
+
+`/list` and `/feedback` both grow with everything ever published, so neither
+returns the whole set. Both take `{ limit, offset }` and answer with a `total`;
+`/admin` shows one page and offers to load the next.
+
+- **`/list`** returns 20 projects, each with its 10 newest revisions plus a
+  `revisionCount`. Pass `{ project: "<slug>", revisionLimit: 500 }` for one
+  project's full history — that is what "Show all" on the card does. `limit` is
+  clamped to 100.
+- **`/feedback`** pages over *revisions that have comments*, newest first, and
+  reads only that page's threads. Before this it read one S3 object per commented
+  revision on every single page load, then discarded all but 200 comments.
+  The consequence to know about: a page boundary is a thread, not a comment, so a
+  page can return more comments than `limit`. Ordering the comments themselves
+  would mean reading every thread to find out which are recent — the exact
+  fan-out being avoided. `total` counts commented revisions.
+
+### Signing in, and staying signed in
+
+Token lifetimes are set explicitly on the user pool client — 60-minute ID and
+access tokens, a **90-day refresh token** — rather than left to Cognito's
+defaults, because the refresh window is the only one a human feels: it decides
+how often signing in again is unavoidable. Refresh token rotation is deliberately
+off; it invalidates the previous token within a minute, so two admin tabs
+refreshing at once would race and lose the session.
+
+The admin app treats a failed refresh as recoverable unless Cognito says the grant
+itself is dead (`invalid_grant`). A throttle, a 5xx or a dropped connection is
+retried with backoff and **leaves the tokens in place** — discarding a 90-day
+session over one bad network moment is what used to make sign-ins feel weekly. It
+also refreshes 5 minutes ahead of expiry, on a timer while a tab is open, and
+shares one in-flight refresh across concurrent requests.
+
+When a sign-in genuinely is needed the app goes straight to Google rather than to
+a page with a button on it, so the usual case is an invisible redirect; a guard
+stops that from looping if the round trip comes back still unauthenticated. And
+because localStorage is per-origin, arriving on the CloudFront domain redirects to
+the custom domain — otherwise a signed-in session simply looks absent.
+
 ## Why one viewer SPA, not per-revision HTML
 
 `viewer/index.html` serves every project and revision; a CloudFront function

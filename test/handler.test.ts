@@ -26,6 +26,11 @@ import {
   findDuplicateRevision,
   revisionForResume,
   buildManifest,
+  parsePage,
+  pageOfProjects,
+  feedbackTargets,
+  DEFAULT_LIST_LIMIT,
+  MAX_LIST_LIMIT,
   parseUploadKey,
   validateComment,
   isPreconditionError,
@@ -810,5 +815,174 @@ describe('metadata shape', () => {
   it('starts empty and stays JSON-round-trippable', () => {
     const meta: Metadata = projectWith(2);
     expect(JSON.parse(JSON.stringify(meta))).toEqual(meta);
+  });
+});
+
+// --- paging -----------------------------------------------------------------
+
+/**
+ * `count` projects, each with `revisions` ready revisions, published a minute
+ * further into the past for each project — so the expected newest-first order is
+ * project-0, project-1, ... and the assertions below can name it.
+ */
+function projectsPublishedInOrder(count: number, revisions = 1): Metadata {
+  const meta = emptyMetadata();
+  for (let p = 0; p < count; p++) {
+    const slug = `project-${p}`;
+    for (let r = 0; r < revisions; r++) {
+      const rev = reserveRevision(meta, slug, { now: NOW });
+      const entry = meta.projects[slug].revisions[String(rev)];
+      entry.status = 'ready';
+      entry.publishedAt = new Date(Date.parse(NOW) - p * 60_000 + r * 1_000).toISOString();
+    }
+  }
+  return meta;
+}
+
+describe('parsePage', () => {
+  it('falls back to the defaults when the caller says nothing', () => {
+    expect(parsePage({}, { limit: DEFAULT_LIST_LIMIT, max: MAX_LIST_LIMIT })).toEqual({
+      limit: DEFAULT_LIST_LIMIT,
+      offset: 0,
+    });
+  });
+
+  it('takes an explicit window', () => {
+    expect(parsePage({ limit: 5, offset: 40 }, { limit: 20, max: 100 })).toEqual({
+      limit: 5,
+      offset: 40,
+    });
+  });
+
+  // A caller asking for more than the ceiling gets the ceiling: that is the
+  // useful answer, and it is what stops a client from opting out of paging.
+  it('clamps a limit above the ceiling instead of refusing it', () => {
+    expect(parsePage({ limit: 10_000 }, { limit: 20, max: 100 }).limit).toBe(100);
+  });
+
+  it('never returns a zero-sized page', () => {
+    expect(parsePage({ limit: 0 }, { limit: 20, max: 100 }).limit).toBe(1);
+  });
+
+  // A value that is not a count at all is a mistake in the caller, not a request
+  // to be clamped — same treatment parseRevision gives one.
+  it.each<[Record<string, unknown>, string]>([
+    [{ limit: -1 }, 'negative limit'],
+    [{ limit: 1.5 }, 'fractional limit'],
+    [{ limit: 'twenty' }, 'non-numeric limit'],
+    [{ offset: -1 }, 'negative offset'],
+    [{ offset: '20; DROP' }, 'non-numeric offset'],
+  ])('rejects %o (%s)', (body) => {
+    expect(() => parsePage(body, { limit: 20, max: 100 })).toThrow(
+      /must be a non-negative integer/,
+    );
+  });
+});
+
+describe('pageOfProjects', () => {
+  const page = (meta: Metadata, opts: Partial<Parameters<typeof pageOfProjects>[1]> = {}) =>
+    pageOfProjects(meta, { limit: 20, offset: 0, revisionLimit: 10, ...opts });
+
+  it('reports the full total alongside a partial page', () => {
+    const { projects, total } = page(projectsPublishedInOrder(25), { limit: 10 });
+    expect(projects).toHaveLength(10);
+    expect(total).toBe(25);
+  });
+
+  it('orders projects by most recent publish, newest first', () => {
+    const { projects } = page(projectsPublishedInOrder(3));
+    expect(projects.map((p) => p.slug)).toEqual(['project-0', 'project-1', 'project-2']);
+  });
+
+  it('walks the whole set without repeating or skipping a project', () => {
+    const meta = projectsPublishedInOrder(25);
+    const seen = [
+      ...page(meta, { limit: 10, offset: 0 }).projects,
+      ...page(meta, { limit: 10, offset: 10 }).projects,
+      ...page(meta, { limit: 10, offset: 20 }).projects,
+    ].map((p) => p.slug);
+    expect(seen).toHaveLength(25);
+    expect(new Set(seen).size).toBe(25);
+  });
+
+  it('returns nothing for an offset past the end, without throwing', () => {
+    const { projects, total } = page(projectsPublishedInOrder(3), { offset: 99 });
+    expect(projects).toEqual([]);
+    expect(total).toBe(3);
+  });
+
+  // The reason revisionCount exists: the page carries a window, and the UI has to
+  // be able to say so rather than implying the project has only these few.
+  it('caps revisions per project but still reports how many there are', () => {
+    const { projects } = page(projectsPublishedInOrder(1, 47), { revisionLimit: 10 });
+    expect(projects[0].revisions).toHaveLength(10);
+    expect(projects[0].revisionCount).toBe(47);
+  });
+
+  it('gives the newest revisions first, so a window keeps the useful end', () => {
+    const { projects } = page(projectsPublishedInOrder(1, 47), { revisionLimit: 3 });
+    expect(projects[0].revisions.map((r) => r.rev)).toEqual([47, 46, 45]);
+  });
+
+  it('projects a project that has never published without crashing on latest', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW }); // still processing
+    const { projects } = page(meta);
+    expect(projects[0].latest).toBeNull();
+    expect(projects[0].revisionCount).toBe(1);
+  });
+
+  it('handles an index with no projects at all', () => {
+    expect(page(emptyMetadata())).toEqual({ projects: [], total: 0 });
+  });
+});
+
+describe('feedbackTargets', () => {
+  /** Give a revision `n` comments, as actionComment would. */
+  function withComments(meta: Metadata, slug: string, rev: number, n: number) {
+    meta.projects[slug].revisions[String(rev)].commentCount = n;
+    return meta;
+  }
+
+  it('lists only revisions that actually have comments', () => {
+    const meta = projectsPublishedInOrder(1, 3);
+    withComments(meta, 'project-0', 2, 5);
+    expect(feedbackTargets(meta)).toHaveLength(1);
+    expect(feedbackTargets(meta)[0]).toMatchObject({ slug: 'project-0', rev: 2 });
+  });
+
+  it('is empty when nothing has been commented on', () => {
+    expect(feedbackTargets(projectsPublishedInOrder(3, 2))).toEqual([]);
+  });
+
+  // The ordering is the whole point: it lets the roll-up slice a page *before*
+  // reading any thread, instead of reading every thread to find the recent ones.
+  it('orders newest revision first', () => {
+    const meta = projectsPublishedInOrder(3, 1);
+    for (const p of ['project-0', 'project-1', 'project-2']) withComments(meta, p, 1, 1);
+    expect(feedbackTargets(meta).map((t) => t.slug)).toEqual([
+      'project-0',
+      'project-1',
+      'project-2',
+    ]);
+  });
+
+  // Two revisions of one project can share a publishedAt to the millisecond, and
+  // a page boundary that wobbled between requests would duplicate or drop a thread.
+  it('breaks a publishedAt tie deterministically, by revision', () => {
+    const meta = projectsPublishedInOrder(1, 3);
+    for (const rev of [1, 2, 3]) {
+      meta.projects['project-0'].revisions[String(rev)].publishedAt = NOW;
+      withComments(meta, 'project-0', rev, 1);
+    }
+    expect(feedbackTargets(meta).map((t) => t.rev)).toEqual([3, 2, 1]);
+  });
+
+  it('falls back to reservedAt for a revision that never finished publishing', () => {
+    const meta = projectsPublishedInOrder(1, 1);
+    const entry = meta.projects['project-0'].revisions['1'];
+    delete entry.publishedAt;
+    entry.commentCount = 2;
+    expect(feedbackTargets(meta)[0].at).toBe(entry.reservedAt);
   });
 });

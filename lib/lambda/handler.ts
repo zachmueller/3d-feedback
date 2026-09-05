@@ -124,8 +124,25 @@ export const MAX_COMMENT_NAME_LEN = 60;
 export const MAX_COMMENT_TEXT_LEN = 4000;
 /** Per-revision thread cap; the endpoint is public, so it needs a ceiling. */
 export const MAX_COMMENTS_PER_REVISION = 200;
-/** Cap on the admin feedback roll-up. */
+/** Hard ceiling on the admin feedback roll-up, whatever a page asks for. */
 export const MAX_FEEDBACK_ITEMS = 200;
+
+/**
+ * Page sizes for the two admin listings. Both grow with everything ever
+ * published, so neither returns the whole set: `/admin` asks for a page and a
+ * total, and offers to fetch the next one.
+ *
+ * `revisionLimit` is separate because a project accumulates revisions
+ * independently of how many projects exist, and each revision can carry ~1.6 KB
+ * of source provenance. MAX_REVISION_LIMIT is what "Show all revisions" asks
+ * for: high enough to be every revision in practice, not unbounded.
+ */
+export const DEFAULT_LIST_LIMIT = 20;
+export const MAX_LIST_LIMIT = 100;
+export const DEFAULT_REVISION_LIMIT = 10;
+export const MAX_REVISION_LIMIT = 500;
+export const DEFAULT_FEEDBACK_LIMIT = 25;
+export const MAX_FEEDBACK_LIMIT = 100;
 
 const IMMUTABLE_CACHE = 'public, max-age=31536000, immutable';
 const LIVE_CACHE = 'public, max-age=5';
@@ -582,6 +599,131 @@ export function buildManifest(project: ProjectEntry): Manifest {
     latest: computeLatest(project),
     revisions,
   };
+}
+
+// ---------------------------------------------------------------------------
+// Paging the two admin listings
+// ---------------------------------------------------------------------------
+
+/** One project as `/admin` renders it: a window over its revisions. */
+export interface ProjectPageEntry {
+  slug: string;
+  title: string | null;
+  createdAt: string;
+  latest: number | null;
+  /** Newest first, at most the requested `revisionLimit`. */
+  revisions: RevisionEntry[];
+  /** How many the project actually has, so the UI can offer the rest. */
+  revisionCount: number;
+}
+
+/** A revision with feedback on it — what the roll-up pages over. */
+export interface FeedbackTarget {
+  slug: string;
+  rev: number;
+  title: string | null;
+  /** When the revision landed; the roll-up is ordered by this. */
+  at: string;
+}
+
+/** A non-negative integer, or throw naming the field that was wrong. */
+function nonNegativeInt(value: unknown, field: string): number {
+  const n = typeof value === 'number' ? value : Number(String(value).trim());
+  if (!Number.isInteger(n) || n < 0) {
+    throw new BadRequest(`${field} must be a non-negative integer`);
+  }
+  return n;
+}
+
+/**
+ * The page window a listing was asked for.
+ *
+ * `limit` is clamped down to `max` rather than rejected — a caller asking for
+ * more than the ceiling gets the ceiling, which is the useful answer. A value
+ * that is not a count at all (negative, fractional, "20; DROP") is a mistake in
+ * the caller and is rejected, the same way parseRevision rejects one.
+ */
+export function parsePage(
+  body: any,
+  opts: { limit: number; max: number },
+): { limit: number; offset: number } {
+  const rawLimit = body?.limit;
+  const rawOffset = body?.offset;
+  const limit =
+    rawLimit === undefined || rawLimit === null
+      ? opts.limit
+      : Math.min(Math.max(nonNegativeInt(rawLimit, 'limit'), 1), opts.max);
+  const offset =
+    rawOffset === undefined || rawOffset === null ? 0 : nonNegativeInt(rawOffset, 'offset');
+  return { limit, offset };
+}
+
+/**
+ * One page of projects for the admin list, newest activity first, each with at
+ * most `revisionLimit` of its newest revisions.
+ *
+ * The ordering is computed over every project rather than pushed into storage:
+ * metadata.json is a single object that is read whole no matter what, so sorting
+ * the full set costs nothing extra. What paging buys is a bounded *response* and
+ * a bounded DOM — that is the thing that was growing without limit, not the read.
+ */
+export function pageOfProjects(
+  meta: Metadata,
+  opts: { limit: number; offset: number; revisionLimit: number },
+): { projects: ProjectPageEntry[]; total: number } {
+  const ordered = Object.values(meta.projects ?? {})
+    .map((p) => {
+      const revisions = Object.values(p.revisions).sort((a, b) => b.rev - a.rev);
+      return { project: p, revisions };
+    })
+    .sort((a, b) => {
+      const aAt = a.revisions[0]?.publishedAt ?? a.project.createdAt;
+      const bAt = b.revisions[0]?.publishedAt ?? b.project.createdAt;
+      return bAt.localeCompare(aAt);
+    });
+
+  const projects = ordered
+    .slice(opts.offset, opts.offset + opts.limit)
+    .map(({ project, revisions }) => ({
+      slug: project.slug,
+      title: project.title,
+      createdAt: project.createdAt,
+      latest: computeLatest(project),
+      revisions: revisions.slice(0, opts.revisionLimit),
+      revisionCount: revisions.length,
+    }));
+
+  return { projects, total: ordered.length };
+}
+
+/**
+ * Every revision that has feedback on it, newest revision first.
+ *
+ * This is the unit the roll-up pages over, and it comes straight out of the
+ * private index — so a page can be sliced *before* any comment thread is read.
+ * The alternative, ordering the comments themselves, would mean reading every
+ * thread on every load to find out which ones were recent: one S3 GET per
+ * commented revision, growing with everything ever published.
+ */
+export function feedbackTargets(meta: Metadata): FeedbackTarget[] {
+  const targets: FeedbackTarget[] = [];
+  for (const project of Object.values(meta.projects ?? {})) {
+    for (const entry of Object.values(project.revisions)) {
+      if ((entry.commentCount ?? 0) > 0) {
+        targets.push({
+          slug: project.slug,
+          rev: entry.rev,
+          title: project.title,
+          at: entry.publishedAt ?? entry.reservedAt,
+        });
+      }
+    }
+  }
+  // Ties broken by revision number so the order is total, not merely sorted:
+  // two revisions of one project can share a publishedAt to the millisecond.
+  return targets.sort(
+    (a, b) => b.at.localeCompare(a.at) || b.rev - a.rev || a.slug.localeCompare(b.slug),
+  );
 }
 
 export function modelKey(slug: string, rev: number): string {
@@ -1172,22 +1314,57 @@ async function actionComment(event: any) {
   return json(200, { comments: thread.comments });
 }
 
-async function actionList() {
+/**
+ * One page of the admin project list.
+ *
+ * Two shapes, because the page needs both:
+ *
+ *   {}                              the next `limit` projects from `offset`,
+ *                                   each with its 10 newest revisions
+ *   { project, revisionLimit }      that one project, with every revision —
+ *                                   what "Show all revisions" asks for
+ *
+ * `total` is the number of projects that exist, so the UI can say "20 of 63"
+ * and know whether to offer another page.
+ */
+async function actionList(event: any) {
+  const body = parseBody(event);
+  const one = body.project ?? body.slug;
+  const slug = one === undefined || one === null ? null : normalizeSlug(one);
+  const page = parsePage(body, { limit: DEFAULT_LIST_LIMIT, max: MAX_LIST_LIMIT });
+  // Asking for one project by name means asking for all of it; a page of many
+  // projects gets the short per-project window.
+  const revisionLimit =
+    body.revisionLimit === undefined || body.revisionLimit === null
+      ? slug === null
+        ? DEFAULT_REVISION_LIMIT
+        : MAX_REVISION_LIMIT
+      : Math.min(
+          Math.max(nonNegativeInt(body.revisionLimit, 'revisionLimit'), 1),
+          MAX_REVISION_LIMIT,
+        );
+
   const meta = await readMetadata();
-  const projects = Object.values(meta.projects)
-    .map((p) => ({
-      slug: p.slug,
-      title: p.title,
-      createdAt: p.createdAt,
-      latest: computeLatest(p),
-      revisions: Object.values(p.revisions).sort((a, b) => b.rev - a.rev),
-    }))
-    .sort((a, b) => {
-      const aAt = a.revisions[0]?.publishedAt ?? a.createdAt;
-      const bAt = b.revisions[0]?.publishedAt ?? b.createdAt;
-      return bAt.localeCompare(aAt);
+
+  if (slug !== null) {
+    const project = meta.projects[slug];
+    if (!project) return json(404, { error: 'No such project' });
+    const { projects } = pageOfProjects({ projects: { [slug]: project } }, {
+      limit: 1,
+      offset: 0,
+      revisionLimit,
     });
-  return json(200, { projects, siteUrl: siteUrl() });
+    return json(200, { projects, total: 1, offset: 0, limit: 1, siteUrl: siteUrl() });
+  }
+
+  const { projects, total } = pageOfProjects(meta, { ...page, revisionLimit });
+  return json(200, {
+    projects,
+    total,
+    offset: page.offset,
+    limit: page.limit,
+    siteUrl: siteUrl(),
+  });
 }
 
 async function actionEdit(event: any) {
@@ -1271,19 +1448,29 @@ async function actionDelete(event: any) {
   return json(200, { deleted: { project: slug, revision: rev } });
 }
 
-/** Admin roll-up: recent comments across every project. */
-async function actionFeedback() {
+/**
+ * Admin roll-up: recent comments across every project, one page at a time.
+ *
+ * The page is sliced over `feedbackTargets` — revisions with feedback, from the
+ * private index — *before* any thread is read, so the S3 fan-out is bounded by
+ * the page size instead of by everything ever published.
+ *
+ * The consequence is worth being explicit about: a page boundary is a revision
+ * thread, not a comment, so a page can return more than `limit` comments. That
+ * is the price of not reading every thread to find out which comments are recent,
+ * and it is the right one — `total` counts commented revisions, and the ordering
+ * within the page is still newest comment first.
+ */
+async function actionFeedback(event: any) {
   const assets = env('ASSETS_BUCKET');
+  const page = parsePage(parseBody(event), {
+    limit: DEFAULT_FEEDBACK_LIMIT,
+    max: MAX_FEEDBACK_LIMIT,
+  });
   const meta = await readMetadata();
 
-  const targets: Array<{ slug: string; rev: number; title: string | null }> = [];
-  for (const project of Object.values(meta.projects)) {
-    for (const entry of Object.values(project.revisions)) {
-      if ((entry.commentCount ?? 0) > 0) {
-        targets.push({ slug: project.slug, rev: entry.rev, title: project.title });
-      }
-    }
-  }
+  const all = feedbackTargets(meta);
+  const targets = all.slice(page.offset, page.offset + page.limit);
 
   const items: Array<Comment & { project: string; title: string | null; revision: number; url: string }> = [];
   const CONCURRENCY = 8;
@@ -1313,7 +1500,12 @@ async function actionFeedback() {
   );
 
   items.sort((a, b) => (b.at ?? '').localeCompare(a.at ?? ''));
-  return json(200, { items: items.slice(0, MAX_FEEDBACK_ITEMS) });
+  return json(200, {
+    items: items.slice(0, MAX_FEEDBACK_ITEMS),
+    total: all.length,
+    offset: page.offset,
+    limit: page.limit,
+  });
 }
 
 const ADMIN_ACTIONS = new Set(['list', 'edit', 'delete', 'feedback']);
@@ -1335,13 +1527,13 @@ async function handleHttp(event: any) {
       case 'comment':
         return await actionComment(event);
       case 'list':
-        return await actionList();
+        return await actionList(event);
       case 'edit':
         return await actionEdit(event);
       case 'delete':
         return await actionDelete(event);
       case 'feedback':
-        return await actionFeedback();
+        return await actionFeedback(event);
       default:
         return json(404, { error: `Unknown action: ${action}` });
     }

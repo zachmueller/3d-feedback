@@ -302,6 +302,20 @@ export class ThreedHostStack extends Stack {
       userPool,
       generateSecret: false, // public SPA client (PKCE)
       authFlows: { userSrp: true },
+      // Stated rather than inherited. Cognito's defaults are 60 min / 60 min /
+      // 30 days, and only the last of the three is one a human ever feels: it
+      // decides how often signing in again is unavoidable. Leaving it implicit
+      // meant the answer lived in AWS's documentation instead of here.
+      accessTokenValidity: Duration.minutes(60),
+      idTokenValidity: Duration.minutes(60),
+      refreshTokenValidity: Duration.days(90),
+      // Default is already true; pinned because a 90-day window makes signing
+      // out the only thing that ends a session, so it had better end it.
+      enableTokenRevocation: true,
+      // Refresh token rotation is deliberately NOT enabled. It invalidates the
+      // previous token after a grace period of at most 60 seconds, so two admin
+      // tabs refreshing at once would race and lose the session — the exact
+      // failure the client-side refresh handling exists to avoid.
       oAuth: {
         flows: { authorizationCodeGrant: true },
         scopes: [

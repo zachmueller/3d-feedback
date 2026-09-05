@@ -19,17 +19,24 @@
   </div>
 
   <script type="module">
-    import { beginLogin, handleAuthCallback, getIdToken, el, setStatus } from '/app/app.js';
+    import {
+      beginLogin, handleAuthCallback, getIdToken, canonicalizeOrigin, el, setStatus,
+    } from '/app/app.js';
 
     const statusNode = el('status');
     const signinBtn = el('signin');
 
     (async () => {
       try {
-        // If we're returning from the Hosted UI with ?code=, finish the exchange.
-        const wasCallback = await handleAuthCallback();
-        if (wasCallback) {
-          window.location.assign('/admin');
+        // One origin, one token store — do this before reading any token, or a
+        // signed-in user on the CloudFront domain looks signed out.
+        if (await canonicalizeOrigin()) return;
+
+        // If we're returning from the Hosted UI with ?code=, finish the exchange
+        // and go back to whatever page sent us here.
+        const callback = await handleAuthCallback();
+        if (callback) {
+          window.location.assign(callback.returnTo);
           return;
         }
         // Already signed in? Go straight to the admin list.
@@ -37,6 +44,11 @@
         if (token) {
           window.location.assign('/admin');
           return;
+        }
+        // requireAuth tried a silent re-auth and came back with nothing, so it
+        // sent us here rather than trying again. Say why the button is showing.
+        if (new URLSearchParams(location.search).get('reauth') === 'failed') {
+          setStatus(statusNode, 'info', 'Please sign in again to continue.');
         }
       } catch (err) {
         setStatus(statusNode, 'err', err.message || String(err));

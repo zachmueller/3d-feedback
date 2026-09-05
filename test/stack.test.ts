@@ -217,6 +217,36 @@ describe('Cognito', () => {
       ProviderType: 'Google',
     });
   });
+
+  // These used to be absent, which silently meant Cognito's defaults — and the
+  // 30-day refresh window among them was the difference between signing in twice
+  // a year and signing in monthly. Losing them again would not fail a deploy or
+  // show up in a diff of behaviour, only in how often a human sees Google.
+  // 129600 minutes is 90 days; CDK normalizes every duration here to minutes.
+  it('pins the token lifetimes instead of inheriting AWS defaults', () => {
+    synth().hasResourceProperties('AWS::Cognito::UserPoolClient', {
+      AccessTokenValidity: 60,
+      IdTokenValidity: 60,
+      RefreshTokenValidity: 129600,
+      TokenValidityUnits: {
+        AccessToken: 'minutes',
+        IdToken: 'minutes',
+        RefreshToken: 'minutes',
+      },
+      // A 90-day window makes signing out the only thing that ends a session.
+      EnableTokenRevocation: true,
+    });
+  });
+
+  // Rotation invalidates the previous refresh token after a grace period of at
+  // most 60 seconds, so two admin tabs refreshing at once would race and lose the
+  // session — the exact failure the client-side refresh handling exists to avoid.
+  it('leaves refresh token rotation off', () => {
+    const clients = synth().findResources('AWS::Cognito::UserPoolClient');
+    for (const client of Object.values(clients)) {
+      expect(client.Properties.RefreshTokenRotation).toBeUndefined();
+    }
+  });
 });
 
 describe('custom domain', () => {

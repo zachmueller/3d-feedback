@@ -36,6 +36,10 @@
       No projects yet. Publish one with <code>tools/publish.sh model.glb --project my-part</code>.
     </div>
     <div id="loading" class="empty"><span class="spinner"></span> Loading…</div>
+    <div id="projectsMore" class="more hidden">
+      <span id="projectsCount" class="meta"></span>
+      <button class="btn secondary small" data-act="more-projects">Load more</button>
+    </div>
 
     <section id="feedback">
       <div class="row">
@@ -45,12 +49,16 @@
       </div>
       <div id="feedbackList" class="stack"></div>
       <div id="feedbackEmpty" class="empty hidden">No feedback yet.</div>
+      <div id="feedbackMore" class="more hidden">
+        <span id="feedbackCount" class="meta"></span>
+        <button class="btn secondary small" data-act="more-feedback">Load more</button>
+      </div>
     </section>
   </main>
 
   <script type="module">
     import {
-      requireAuth, api, getConfig, shareUrl, logout,
+      requireAuth, api, getConfig, shareUrl, logout, canonicalizeOrigin, startTokenRefresh,
       el, setStatus, copyText, escapeHtml, fmtDate,
     } from '/app/app.js';
 
@@ -62,6 +70,17 @@
     const feedbackEmpty = el('feedbackEmpty');
 
     let cfg;
+
+    // Both lists are paged: the first load is one page, and "Load more" appends.
+    // Nothing here asks for everything, so the page stays the same size to load
+    // whether there are five projects or five hundred.
+    const PROJECT_PAGE = 20;
+    const FEEDBACK_PAGE = 25;
+    // Matches MAX_REVISION_LIMIT in the handler: what "Show all" asks for.
+    const ALL_REVISIONS = 500;
+
+    const projectPage = { loaded: 0, total: 0 };
+    const feedbackPage = { loaded: 0, total: 0 };
 
     el('logout').addEventListener('click', (e) => { e.preventDefault(); logout(); });
     el('refresh').addEventListener('click', () => loadProjects());
@@ -124,10 +143,32 @@
       </li>`;
     }
 
+    /**
+     * The revision list, plus what it is a window onto. `revisionCount` is every
+     * revision the project has; only the newest few come down with the page, so a
+     * long-running project does not make this page expensive to load.
+     */
+    function revisionList(project) {
+      const shown = project.revisions.length;
+      const total = project.revisionCount ?? shown;
+      const rows = project.revisions.map((r) => revisionRow(project, r)).join('');
+      const label = total === shown
+        ? `${total} revision${total === 1 ? '' : 's'}`
+        : `${shown} of ${total} revisions`;
+      const showAll = total > shown
+        ? `<button class="btn tiny secondary" data-act="all-revs" data-slug="${escapeHtml(project.slug)}">Show all ${total}</button>`
+        : '';
+      return `<details${total <= 3 ? ' open' : ''} data-project="${escapeHtml(project.slug)}">
+          <summary>${label}</summary>
+          <ul class="revs">${rows}</ul>
+          ${showAll ? `<div class="more">${showAll}</div>` : ''}
+        </details>`;
+    }
+
     function projectCard(project) {
       const latestUrl = shareUrl(cfg, project.slug);
-      const count = project.revisions.length;
-      return `<div class="card">
+      const count = project.revisionCount ?? project.revisions.length;
+      return `<div class="card" data-card="${escapeHtml(project.slug)}">
         <div class="row">
           <div>
             <div class="title">${escapeHtml(project.title || project.slug)}</div>
@@ -141,30 +182,51 @@
           <button class="btn tiny secondary" data-act="title" data-slug="${escapeHtml(project.slug)}">Rename</button>
           <button class="btn tiny danger" data-act="del-project" data-slug="${escapeHtml(project.slug)}">Delete all</button>
         </div>
-        <details${count <= 3 ? ' open' : ''}>
-          <summary>${count} revision${count === 1 ? '' : 's'}</summary>
-          <ul class="revs">${project.revisions.map((r) => revisionRow(project, r)).join('')}</ul>
-        </details>
+        ${revisionList(project)}
       </div>`;
     }
 
-    async function loadProjects() {
+    /** Show "20 of 63" and the Load more button, or hide the row when done. */
+    function updateMore(node, countNode, page, noun) {
+      const done = page.loaded >= page.total;
+      node.classList.toggle('hidden', done);
+      countNode.textContent = done ? '' : `Showing ${page.loaded} of ${page.total} ${noun}`;
+    }
+
+    /**
+     * One page of projects. `append` adds the next page instead of replacing the
+     * list, so "Load more" does not re-render (or re-fetch) what is already there.
+     */
+    async function loadProjects({ append = false } = {}) {
       loadingNode.classList.remove('hidden');
       try {
-        const { projects } = await api('list');
+        // A reload after an edit keeps however many pages were open, so the view
+        // does not snap back to the first page under the user.
+        const offset = append ? projectPage.loaded : 0;
+        const limit = append
+          ? PROJECT_PAGE
+          : Math.max(PROJECT_PAGE, projectPage.loaded || PROJECT_PAGE);
+        const { projects, total } = await api('list', { offset, limit });
         loadingNode.classList.add('hidden');
-        projectsNode.innerHTML = projects.map(projectCard).join('');
-        emptyNode.classList.toggle('hidden', projects.length > 0);
+
+        if (append) {
+          projectsNode.insertAdjacentHTML('beforeend', projects.map(projectCard).join(''));
+          projectPage.loaded += projects.length;
+        } else {
+          projectsNode.innerHTML = projects.map(projectCard).join('');
+          projectPage.loaded = projects.length;
+        }
+        projectPage.total = total;
+        emptyNode.classList.toggle('hidden', projectPage.total > 0);
+        updateMore(el('projectsMore'), el('projectsCount'), projectPage, 'projects');
       } catch (err) {
         loadingNode.classList.add('hidden');
         setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
       }
     }
 
-    async function loadFeedback() {
-      try {
-        const { items } = await api('feedback');
-        feedbackNode.innerHTML = items.map((c) => `
+    function commentCard(c) {
+      return `
           <div class="card comment">
             <div class="revhead">
               <strong>${escapeHtml(c.name || 'Anonymous')}</strong>
@@ -173,8 +235,35 @@
               <a href="${escapeHtml(c.url)}" target="_blank" rel="noopener" class="mono">/${escapeHtml(c.project)}/${c.revision}</a>
             </div>
             <div class="ctext">${escapeHtml(c.text)}</div>
-          </div>`).join('');
-        feedbackEmpty.classList.toggle('hidden', items.length > 0);
+          </div>`;
+    }
+
+    /**
+     * One page of feedback. The page is counted in *revision threads*, not
+     * comments — that is what lets the API read only a page's worth of threads
+     * instead of every thread on every load — so a page can bring back more
+     * comments than the page size.
+     */
+    async function loadFeedback({ append = false } = {}) {
+      try {
+        const offset = append ? feedbackPage.loaded : 0;
+        const limit = append
+          ? FEEDBACK_PAGE
+          : Math.max(FEEDBACK_PAGE, feedbackPage.loaded || FEEDBACK_PAGE);
+        const { items, total, limit: served } = await api('feedback', { offset, limit });
+        // Threads consumed, which is what `total` counts — not items rendered.
+        const consumed = Math.min(served, Math.max(total - offset, 0));
+
+        if (append) {
+          feedbackNode.insertAdjacentHTML('beforeend', items.map(commentCard).join(''));
+          feedbackPage.loaded += consumed;
+        } else {
+          feedbackNode.innerHTML = items.map(commentCard).join('');
+          feedbackPage.loaded = consumed;
+        }
+        feedbackPage.total = total;
+        feedbackEmpty.classList.toggle('hidden', total > 0);
+        updateMore(el('feedbackMore'), el('feedbackCount'), feedbackPage, 'threads');
       } catch (err) {
         setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
       }
@@ -192,6 +281,35 @@
           const original = button.textContent;
           button.textContent = ok ? 'Copied!' : 'Copy failed';
           setTimeout(() => { button.textContent = original; }, 1500);
+          return;
+        }
+        if (act === 'more-projects') {
+          button.disabled = true;
+          try { await loadProjects({ append: true }); } finally { button.disabled = false; }
+          return;
+        }
+        if (act === 'more-feedback') {
+          button.disabled = true;
+          try { await loadFeedback({ append: true }); } finally { button.disabled = false; }
+          return;
+        }
+        if (act === 'all-revs') {
+          // Fetch this one project's full revision list and swap only its card,
+          // leaving the rest of the page — and the other cards' windows — alone.
+          button.disabled = true;
+          try {
+            const { projects } = await api('list', { project: slug, revisionLimit: ALL_REVISIONS });
+            const card = projectsNode.querySelector(`[data-card="${CSS.escape(slug)}"]`);
+            const details = card?.querySelector('details');
+            if (projects[0] && details) {
+              details.outerHTML = revisionList(projects[0]);
+              card.querySelector('details').open = true;
+            }
+          } finally {
+            // The button is gone once the swap succeeds; re-enable it if it isn't,
+            // so a failed fetch leaves something to click again.
+            if (button.isConnected) button.disabled = false;
+          }
           return;
         }
         if (act === 'title') {
@@ -228,8 +346,14 @@
     });
 
     (async () => {
+      // One origin, one token store — before requireAuth, or a signed-in user
+      // arriving on the CloudFront domain gets sent through a needless sign-in.
+      if (await canonicalizeOrigin()) return;
       await requireAuth();
       cfg = await getConfig();
+      // Keep the token fresh while this tab is open, so coming back to a page
+      // left open overnight is not the moment a refresh turns out to be needed.
+      startTokenRefresh();
       await Promise.all([loadProjects(), loadFeedback()]);
     })().catch((err) => {
       // requireAuth rejects on purpose after starting the redirect to /login;

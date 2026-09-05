@@ -134,6 +134,15 @@ section#feedback { margin-top: 36px; scroll-margin-top: 70px; }
 .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .empty { color: var(--muted); padding: 14px 0; }
 
+/* "Showing 20 of 63 projects" + Load more, under either list. */
+.more {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding: 14px 0;
+}
+
 /* --- revisions ------------------------------------------------------------ */
 
 details { margin-top: 10px; }
