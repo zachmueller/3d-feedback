@@ -131,6 +131,26 @@ section#feedback { margin-top: 36px; scroll-margin-top: 70px; }
 
 .title { font-weight: 600; }
 .note { color: var(--muted); font-size: 13px; white-space: pre-wrap; }
+
+/* A long or tall revision note carries both a one-line preview and the full text;
+   only one is ever shown. See notePreview in app.js for which notes get this. */
+.note .note-full { display: none; }
+.note:not(.collapsed) .note-preview { display: none; }
+.note:not(.collapsed) .note-full { display: inline; }
+
+/* Reads as a link rather than a button: it sits in a row of prose, and the tiny
+   bordered .btn next to body text draws more attention than an affordance should. */
+.note-toggle {
+  background: none;
+  border: 0;
+  padding: 0;
+  margin-top: 3px;
+  font: inherit;
+  font-size: 12px;
+  color: var(--accent);
+  cursor: pointer;
+}
+.note-toggle:hover { text-decoration: underline; }
 .meta { color: var(--muted); font-size: 12px; margin-top: 2px; }
 .empty { color: var(--muted); padding: 14px 0; }
 

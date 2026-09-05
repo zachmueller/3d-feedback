@@ -464,3 +464,47 @@ export function fmtDate(iso) {
   if (!iso) return '';
   try { return new Date(iso).toLocaleString(); } catch { return iso; }
 }
+
+/** Collapse a revision note to one line past this many characters. */
+export const NOTE_PREVIEW_CHARS = 100;
+/**
+ * How far over the limit a note may run before it is worth collapsing. Without
+ * this, a note a few characters too long gets a toggle that reveals almost
+ * nothing — which costs more height than it saves.
+ */
+const NOTE_PREVIEW_SLACK = 20;
+/** More lines than this is worth collapsing however short the note is. */
+const NOTE_PREVIEW_LINES = 2;
+
+/**
+ * The collapsed form of a revision note, or null when collapsing it would gain
+ * nothing.
+ *
+ * Notes are prose — up to MAX_NOTES_LEN, and `.note` renders them `pre-wrap` — so
+ * a few verbose ones set the scroll height of the whole page. The preview is
+ * deliberately a single line: flattening newlines is what makes this work for a
+ * note that is *tall* as well as one that is merely long, and those are different
+ * problems (twelve short lines take more room than one hundred characters).
+ *
+ * Returning null rather than the text itself is the point of the signature: the
+ * caller offers a toggle only where one actually hides something.
+ */
+export function notePreview(text, {
+  chars = NOTE_PREVIEW_CHARS,
+  slack = NOTE_PREVIEW_SLACK,
+  lines = NOTE_PREVIEW_LINES,
+} = {}) {
+  const full = String(text ?? '').trim();
+  if (full.length <= chars + slack && full.split('\n').length <= lines) return null;
+
+  const oneLine = full.replace(/\s+/g, ' ');
+  // Short but tall: the whole note fits once its newlines are gone.
+  if (oneLine.length <= chars) return oneLine;
+
+  const cut = oneLine.slice(0, chars);
+  const lastSpace = cut.lastIndexOf(' ');
+  // Prefer a word boundary, but not at the cost of most of the preview — a note
+  // with one very long token would otherwise collapse to almost nothing.
+  const trimmed = lastSpace > chars * 0.6 ? cut.slice(0, lastSpace) : cut;
+  return `${trimmed.trimEnd()}…`;
+}

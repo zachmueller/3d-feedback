@@ -59,7 +59,7 @@
   <script type="module">
     import {
       requireAuth, api, getConfig, shareUrl, logout, canonicalizeOrigin, startTokenRefresh,
-      el, setStatus, copyText, escapeHtml, fmtDate,
+      el, setStatus, copyText, escapeHtml, fmtDate, notePreview,
     } from '/app/app.js';
 
     const projectsNode = el('projects');
@@ -118,6 +118,25 @@
       return `<div class="meta mono" title="${escapeHtml(full)}">built from ${escapeHtml(parts.join(' · '))}</div>`;
     }
 
+    /**
+     * A revision's notes, collapsed to one line when they are long or tall enough
+     * to be worth it (notePreview decides). Both forms go into the DOM and CSS
+     * switches between them, so expanding is a class flip with nothing to re-fetch
+     * and no state to keep outside the element itself.
+     *
+     * Note the absence of whitespace between the two spans: `.note` is pre-wrap,
+     * so indentation inside it would render as a visible gap.
+     */
+    function noteBlock(rev) {
+      const text = (rev.notes || '').trim();
+      if (!text) return '<div class="note">No notes.</div>';
+      const preview = notePreview(text);
+      if (preview === null) return `<div class="note">${escapeHtml(text)}</div>`;
+      return `<div class="note collapsed"><span class="note-preview">${escapeHtml(preview)}</span>`
+        + `<span class="note-full">${escapeHtml(text)}</span></div>`
+        + `<button class="note-toggle" data-act="toggle-note" aria-expanded="false">Show more</button>`;
+    }
+
     function revisionRow(project, rev) {
       const url = shareUrl(cfg, project.slug, rev.rev);
       // A revision that never finished processing has no page to link to.
@@ -137,7 +156,7 @@
           <button class="btn tiny secondary" data-act="notes" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Notes</button>
           <button class="btn tiny danger" data-act="del-rev" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Delete</button>
         </div>
-        <div class="note">${escapeHtml(rev.notes || 'No notes.')}</div>
+        ${noteBlock(rev)}
         <div class="meta mono">${escapeHtml(fmtDate(rev.publishedAt || rev.reservedAt))} · ${escapeHtml(fmtBytes(rev.bytes))}</div>
         ${sourceLine(rev)}
       </li>`;
@@ -281,6 +300,17 @@
           const original = button.textContent;
           button.textContent = ok ? 'Copied!' : 'Copy failed';
           setTimeout(() => { button.textContent = original; }, 1500);
+          return;
+        }
+        if (act === 'toggle-note') {
+          // The button sits immediately after its own .note, both children of the
+          // revision's <li>, so this cannot reach a neighbouring revision's note.
+          const note = button.parentElement?.querySelector('.note');
+          if (note) {
+            const collapsed = note.classList.toggle('collapsed');
+            button.textContent = collapsed ? 'Show more' : 'Show less';
+            button.setAttribute('aria-expanded', String(!collapsed));
+          }
           return;
         }
         if (act === 'more-projects') {
