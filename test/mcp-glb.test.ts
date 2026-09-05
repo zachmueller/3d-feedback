@@ -16,7 +16,13 @@ import * as os from 'os';
 import * as path from 'path';
 
 import { loadConfig } from '../tools/mcp/config';
-import { GlbError, inspectGlb, parseGlbContainer, predictParts } from '../tools/mcp/glb';
+import {
+  GlbError,
+  inspectGlb,
+  parseGlbContainer,
+  predictParts,
+  readSourceFromGlb,
+} from '../tools/mcp/glb';
 
 const cfg = loadConfig({ env: { PATH: '' } }).values;
 
@@ -260,6 +266,115 @@ describe('warnings a modeller should act on', () => {
       [0],
     );
     expect(inspect(json).join(' ')).toMatch(/repeated checkbox names \(Same\)/);
+  });
+});
+
+// --- source provenance carried inside the container -------------------------
+//
+// The contract's read side. What makes it worth pinning is that every failure here
+// is silent by nature: a producer that typos a field, or writes a record under a
+// schema this deployment does not know, gets a .glb that looks perfectly fine.
+
+describe('readSourceFromGlb', () => {
+  const SOURCE = {
+    schema: '3d-feedback/source@1',
+    repo: '3d-models',
+    commit: 'a'.repeat(40),
+    path: 'models/cloth-basket-small',
+    build: 'make cloth-basket-small',
+    recreate: 'git clone … && git checkout … && make cloth-basket-small',
+  };
+
+  const withSource = (source: unknown): any => {
+    const json = gltf([{ children: [1, 2] }, { name: 'A', mesh: 0 }, { name: 'B', mesh: 0 }], [], [0]);
+    json.asset.extras = { source };
+    return json;
+  };
+
+  it('reads a well-formed record back', () => {
+    const { source, error, warnings } = readSourceFromGlb(withSource(SOURCE));
+    expect(error).toBeNull();
+    expect(warnings).toEqual([]);
+    expect(source).toEqual(SOURCE);
+  });
+
+  it('reports nothing at all for a .glb with no extras', () => {
+    expect(readSourceFromGlb(gltf([{ name: 'Solo', mesh: 0 }], [], [0]))).toEqual({
+      source: null,
+      error: null,
+      warnings: [],
+    });
+  });
+
+  // extras.source is a plausible name for another tool's data. Guessing at a foreign
+  // record would be worse than reading none, so the schema is the gate.
+  it('ignores a record whose schema it does not recognize', () => {
+    const { source, error } = readSourceFromGlb(
+      withSource({ ...SOURCE, schema: 'some-other-tool/v3' }),
+    );
+    expect(source).toBeNull();
+    expect(error).toMatch(/declares schema "some-other-tool\/v3"/);
+  });
+
+  it('ignores a record with no schema at all', () => {
+    const { schema, ...noSchema } = SOURCE;
+    const { source, error } = readSourceFromGlb(withSource(noSchema));
+    expect(source).toBeNull();
+    expect(error).toMatch(/declares schema \(none\)/);
+  });
+
+  // The point of this one: a `commmit` typo would otherwise publish a revision that
+  // records nothing and says nothing about why.
+  it('names fields the contract does not define instead of dropping them silently', () => {
+    const { source, warnings } = readSourceFromGlb(
+      withSource({ ...SOURCE, commmit: 'a'.repeat(40), builtAt: '2026-09-06' }),
+    );
+    expect(warnings.join(' ')).toMatch(/does not define \(commmit, builtAt\)/);
+    // The record is still usable — the fields it did get right are kept.
+    expect(source?.commit).toBe(SOURCE.commit);
+  });
+
+  it('reports a malformed field with the validator’s own message', () => {
+    const { source, error } = readSourceFromGlb(withSource({ ...SOURCE, commit: 'nope' }));
+    expect(source).toBeNull();
+    expect(error).toMatch(/source\.commit must be a git object id/);
+  });
+
+  it('reports a record that has a valid schema and nothing else', () => {
+    const { source, error } = readSourceFromGlb(withSource({ schema: SOURCE.schema }));
+    expect(source).toBeNull();
+    expect(error).toMatch(/records nothing/);
+  });
+
+  it('reports extras.source that is not an object', () => {
+    expect(readSourceFromGlb(withSource('the-commit')).error).toMatch(/is not an object/);
+  });
+});
+
+describe('inspectGlb, on provenance', () => {
+  // The sample is the shared fixture the dev server and the smoke test also use, so
+  // this is the one place the producer-facing contract is exercised end to end
+  // locally.
+  it('surfaces the sample model’s provenance before any publish', () => {
+    const report = inspectGlb(samplePath, cfg);
+    expect(report.source?.repo).toBe('3d-models');
+    expect(report.source?.build).toBe('make sample-clip');
+    expect(report.sourceError).toBeNull();
+  });
+
+  it('makes a broken record loud rather than silently publishing without one', () => {
+    const json = gltf([{ children: [1, 2] }, { name: 'A', mesh: 0 }, { name: 'B', mesh: 0 }], [], [0]);
+    json.asset.extras = { source: { schema: '3d-feedback/source@1', commit: 'nope' } };
+    const file = path.join(dir, 'bad-source.glb');
+    writeGlb(file, json);
+    const report = inspectGlb(file, cfg);
+    expect(report.source).toBeNull();
+    expect(report.sourceError).toMatch(/source\.commit/);
+    // Also in the warnings, so it shows up in the tool summary a caller reads.
+    expect(report.warnings.join(' ')).toMatch(/source\.commit/);
+    // The file itself is still fine: the processor's checks are about bytes, not
+    // metadata, and conflating the two would mislabel where the problem is.
+    expect(report.publishable).toBe(true);
   });
 });
 

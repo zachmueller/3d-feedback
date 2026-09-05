@@ -41,7 +41,7 @@ import {
 } from './config';
 import { checkSetup, type SetupReport } from './doctor';
 import { exportGlb, guiExportSnippet } from './freecad';
-import { formatBytes, GlbError, type GlbReport, inspectGlb } from './glb';
+import { formatBytes, GlbError, type GlbReport, inspectGlb, summarizeSource } from './glb';
 import { PublishError, publishModel, type PublishResult } from './publish';
 import {
   describeStatus,
@@ -142,6 +142,7 @@ function glbSummary(report: GlbReport): string[] {
         ` — ${part.triangles.toLocaleString('en-US')} triangles`,
     );
   }
+  if (report.source) lines.push(...summarizeSource(report.source));
   for (const warning of report.warnings) lines.push(`  ! ${warning}`);
   return lines;
 }
@@ -171,6 +172,7 @@ function publishSummary(result: PublishResult): string[] {
       ];
 
   for (const line of result.log) lines.push(`  · ${line}`);
+  if (result.source && !result.deduped) lines.push('', ...summarizeSource(result.source));
   if (result.verification) lines.push('', ...verifySummary(result.verification));
   return lines;
 }
@@ -205,6 +207,11 @@ function projectSummary(report: ProjectReport): string[] {
         `${rev.commentCount} comment(s)  ${rev.url}`,
     );
     if (rev.notes) lines.push(`        ${rev.notes}`);
+    // Indented under its revision: "which commit was revision 3?" is answered by
+    // reading down this column.
+    if (rev.source) {
+      for (const line of summarizeSource(rev.source)) lines.push(`        ${line}`);
+    }
   }
   return lines;
 }
@@ -316,6 +323,80 @@ const forceField = z
       'new number — which is what makes a retry safe.',
   );
 
+/**
+ * The source-provenance override. Deliberately a whole object rather than a set of
+ * flat arguments, because it is one record with one meaning and a caller should be
+ * able to see that passing half of it is worse than passing none.
+ */
+const sourceField = z
+  .object({
+    repo: z
+      .string()
+      .optional()
+      .describe('Repository identity as a short name ("3d-models"), not a URL.'),
+    cloneUrl: z
+      .string()
+      .optional()
+      .describe(
+        'Where the repository can be cloned from: https://, ssh://, git://, codecommit:: or ' +
+          'user@host:path. Omit when there is no URL a reader could actually use — a wrong one ' +
+          'is worse than none, since the share page shows it verbatim.',
+      ),
+    commit: z
+      .string()
+      .optional()
+      .describe('The exact commit the model was built from: 40 (sha1) or 64 (sha256) hex characters.'),
+    ref: z
+      .string()
+      .optional()
+      .describe('Branch or tag it was built from ("main"). Not a substitute for commit — refs move.'),
+    dirty: z
+      .boolean()
+      .optional()
+      .describe(
+        'True when the working tree had uncommitted changes, so the commit alone does not ' +
+          'identify what was built. Supply tree as well when it is.',
+      ),
+    tree: z
+      .string()
+      .optional()
+      .describe(
+        'git tree object id of what was actually built, as hex. This is how uncommitted work is ' +
+          'represented — a flag plus a hash. Never send a diff or a patch; this lands in a ' +
+          'public manifest.',
+      ),
+    path: z
+      .string()
+      .optional()
+      .describe(
+        'The model\'s directory within the repository ("models/cloth-basket-small"). ' +
+          'Repository-relative: no leading slash and no ".." segment.',
+      ),
+    build: z
+      .string()
+      .optional()
+      .describe('The command that rebuilds it ("make cloth-basket-small"). Displayed, never run.'),
+    recreate: z
+      .string()
+      .optional()
+      .describe(
+        'One short human-readable line telling a reviewer how to recreate this, e.g. ' +
+          '"git clone <url> && git checkout <commit> && make cloth-basket-small". This is the ' +
+          'field a reviewer actually reads, and it is worth more than the rest put together.',
+      ),
+  })
+  .optional()
+  .describe(
+    'Where this model was built from. NORMALLY OMIT THIS: a publisher writes the same record into ' +
+      'the .glb itself as `asset.extras.source`, and this tool lifts it from there — inside the ' +
+      'file it cannot drift from the bytes it describes, it survives being downloaded, and a ' +
+      'rebuild from a different commit is a different file rather than a dedupe. Pass it only when ' +
+      'the .glb carries none (a FreeCAD export does not) or to correct what it says, and know the ' +
+      'one catch: because the API dedupes on the content hash alone, republishing IDENTICAL bytes ' +
+      'with a different source returns the existing revision and drops the override, the same way ' +
+      'it drops a new title or new notes. inspect_glb shows what a file already declares.',
+  );
+
 const readRevisionField = z
   .number()
   .int()
@@ -376,9 +457,12 @@ function registerTools(
           'Parse a .glb and predict what the viewer will show: the parts-panel checkboxes in ' +
           'order, which start switched off because their name carries the `ref_` ' +
           'reference-geometry prefix, triangle counts per part, and whether the file would be ' +
-          'accepted (glTF 2.0 binary, under the 100 MB server-side cap). Use it to confirm an ' +
-          'export looks right before publishing — a revision number is never reused, so a bad ' +
-          'publish cannot be undone, only deleted. Local only; no network, no AWS.',
+          'accepted (glTF 2.0 binary, under the 100 MB server-side cap). It also reports the ' +
+          'source provenance the file carries in `asset.extras.source` — which repository, commit ' +
+          'and rebuild command a reviewer would be shown — so a producer can check that before a ' +
+          'revision number is reserved. Use it to confirm an export looks right before publishing ' +
+          '— a revision number is never reused, so a bad publish cannot be undone, only deleted. ' +
+          'Local only; no network, no AWS.',
         annotations: { readOnlyHint: true },
         inputSchema: {
           glb: z.string().describe('Path to a .glb file.'),
@@ -497,8 +581,10 @@ function registerTools(
           'is over 100 MB. Revision numbers are monotonic and NEVER reused, so retries are made ' +
           'safe two ways: publishing bytes identical to the latest revision returns that revision ' +
           'instead of spending a number, and a publish that failed after reserving one can be ' +
-          'finished by passing its revision. Editing and deleting revisions is not available ' +
-          'here; use the /admin app.',
+          'finished by passing its revision. If the .glb declares where it was built from (in ' +
+          '`asset.extras.source`) that provenance is recorded with the revision and shown to ' +
+          'reviewers; see the `source` argument for the override. Editing and deleting revisions ' +
+          'is not available here; use the /admin app.',
         annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true },
         inputSchema: {
           glb: z.string().describe('Path to the .glb to publish.'),
@@ -507,6 +593,7 @@ function registerTools(
           notes: notesField,
           revision: revisionField,
           force: forceField,
+          source: sourceField,
           timeoutSeconds: z
             .number()
             .positive()
@@ -557,6 +644,7 @@ function registerTools(
           notes: notesField,
           revision: revisionField,
           force: forceField,
+          source: sourceField,
           out: outField,
           linearDeflection: linearDeflectionField,
           angularDeflection: angularDeflectionField,
@@ -601,10 +689,11 @@ function registerTools(
         title: 'List a project’s published revisions',
         description:
           "Read a project's public manifest: its title, which revision is latest, and every " +
-          'published revision with its notes, size, comment count and share URL. This is what a ' +
-          'reviewer can see, so it also answers "did my publish actually appear?" and "what did I ' +
-          'tell them changed last time?". Nothing that is still processing or that failed appears ' +
-          'here — use get_publish_status for those.',
+          'published revision with its notes, size, comment count, share URL and the source it was ' +
+          'built from (repository, commit, path, rebuild command) when it recorded one. This is ' +
+          'what a reviewer can see, so it also answers "did my publish actually appear?", "what ' +
+          'did I tell them changed last time?" and "which commit produced revision 3?". Nothing ' +
+          'that is still processing or that failed appears here — use get_publish_status for those.',
         annotations: { readOnlyHint: true, openWorldHint: true },
         inputSchema: { project: readProjectField },
       },
@@ -637,8 +726,9 @@ function registerTools(
       {
         title: 'Check what happened to a publish',
         description:
-          'Read the status object a publish writes: processing, ready (with the share URL), or ' +
-          'error (with the reason the processor rejected it). This is the tool for a publish whose ' +
+          'Read the status object a publish writes: processing, ready (with the share URL and the ' +
+          'commit it was built from, when one was recorded), or error (with the reason the ' +
+          'processor rejected it). This is the tool for a publish whose ' +
           'wait timed out or whose result was lost — the number was reserved either way, and this ' +
           'says whether it landed. A revision reported as error or still processing can be ' +
           'retried by passing its number as `revision` to publish_model, which reuses it instead ' +
@@ -780,8 +870,17 @@ const INSTRUCTIONS = [
   "Labels in the document become the viewer's parts-panel checkboxes, with a `ref_` prefix",
   'marking context geometry that starts hidden.',
   '',
+  'A revision can also record where it was built from — repository, commit, path, whether the',
+  'tree was dirty, and a line saying how to recreate it. That record travels INSIDE the .glb, in',
+  'asset.extras.source, so it cannot drift from the bytes it describes and a rebuild from a',
+  'different commit is a different file rather than a dedupe. So a producer writes it at export',
+  'time and publishing needs no extra argument; inspect_glb shows what a file declares before',
+  'anything is reserved, and list_revisions and get_publish_status answer "which commit was',
+  'revision 3?". The `source` argument overrides the file, for an export that carries none.',
+  '',
   'Editing notes, deleting a revision and listing every project are not available here:',
-  'those routes need a Google sign-in, so they live in the /admin app.',
+  'those routes need a Google sign-in, so they live in the /admin app. Provenance cannot be',
+  'edited at all, by anyone: it describes bytes that are immutable, so the fix is a new revision.',
   '',
   'Run check_setup when anything fails: it names the broken link and its fix.',
 ].join('\n');

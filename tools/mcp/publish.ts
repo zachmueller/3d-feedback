@@ -20,6 +20,12 @@
  *    readiness is polled from `status/<slug>/<rev>.json`.
  *  - A `ready` status means the processor copied the model, not that a reviewer
  *    can load it; verification (site.ts) is what answers that.
+ *  - A revision can record where it was built from, and that provenance travels
+ *    *inside* the .glb (`asset.extras.source`) rather than as an argument, so it is
+ *    lifted out of the same buffer that gets hashed. That is not a stylistic
+ *    choice: it makes the record a function of the bytes, which is what stops the
+ *    content-hash dedupe from collapsing two builds of the same geometry from
+ *    different commits into one revision. See resolveSource.
  */
 import { createHash } from 'crypto';
 import * as fs from 'fs';
@@ -27,10 +33,18 @@ import * as path from 'path';
 
 // Text caps and sanitising come from the Lambda that will receive this request, so
 // a bad argument is rejected here with the message the API would have used.
-import { BadRequest, MAX_NOTES_LEN, MAX_TITLE_LEN, optionalText } from '../../lib/lambda/handler';
+import {
+  BadRequest,
+  MAX_NOTES_LEN,
+  MAX_TITLE_LEN,
+  normalizeSource,
+  optionalText,
+  type SourceProvenance,
+} from '../../lib/lambda/handler';
 
 import { signHeaders } from './aws';
 import { type Config, PathError, resolveProject, resolveUserPath } from './config';
+import { parseGlbContainer, readSourceFromGlb } from './glb';
 import { errorDetail, type FetchLike, type HttpResult, nodeFetch, parseJson, request } from './http';
 import { siteReader, type StatusObject, verifyRevision, type VerifyReport } from './site';
 
@@ -50,6 +64,12 @@ export interface PublishRequest {
   force?: boolean;
   /** Overrides the configured verifyAfterPublish. */
   verify?: boolean;
+  /**
+   * Where the model was built from. Normally omitted: it is read out of the .glb's
+   * own `asset.extras.source`, which is the whole point of putting it there. Passing
+   * it overrides the file — see the caveat in publishModel.
+   */
+  source?: SourceProvenance | Record<string, unknown>;
 }
 
 export interface PublishResult {
@@ -59,6 +79,8 @@ export interface PublishResult {
   url: string;
   bytes: number;
   contentHash: string;
+  /** The provenance that was recorded, from the file or from the override. */
+  source: SourceProvenance | null;
   /** The API recognised these bytes: no revision was spent and nothing uploaded. */
   deduped: boolean;
   /** This call finished an already-reserved revision. */
@@ -173,6 +195,7 @@ export function publishBody(
   project: string,
   filename: string,
   contentHash: string,
+  source: SourceProvenance | null = null,
 ): Record<string, unknown> {
   const title = optionalText(req.title, MAX_TITLE_LEN);
   const notes = optionalText(req.notes, MAX_NOTES_LEN);
@@ -182,9 +205,41 @@ export function publishBody(
     contentHash,
     ...(title ? { title } : {}),
     ...(notes ? { notes } : {}),
+    ...(source ? { source } : {}),
     ...(req.force ? { force: true } : {}),
     ...(req.revision === undefined ? {} : { revision: req.revision }),
   };
+}
+
+/**
+ * Which provenance to declare: the caller's override, else the file's own extras.
+ *
+ * The override exists for the cases the file cannot cover — a FreeCAD export, whose
+ * writer is FreeCAD's and carries no extras of ours, or a correction. It comes with
+ * one wrinkle worth saying out loud rather than discovering: the API dedupes on the
+ * content hash alone, so republishing *identical bytes* with a different declared
+ * source returns the revision that already holds them and the override is dropped,
+ * exactly as a new title or new notes would be. Provenance read from inside the file
+ * never hits that, because different provenance is different bytes.
+ */
+export function resolveSource(
+  req: PublishRequest,
+  fromFile: SourceProvenance | null,
+  log: string[],
+): SourceProvenance | null {
+  const override = normalizeSource(req.source);
+  if (!override) return fromFile;
+
+  if (fromFile && JSON.stringify(fromFile) !== JSON.stringify(override)) {
+    log.push(
+      'the source argument overrides the provenance inside the .glb; note that republishing ' +
+        'these exact bytes later would dedupe and drop the override, because the API compares ' +
+        'content hashes',
+    );
+  } else if (!fromFile) {
+    log.push('recording the source given as an argument; the .glb itself carries none');
+  }
+  return override;
 }
 
 /** What POST /publish answers with. */
@@ -397,7 +452,29 @@ export async function publishModel(
   const bytes = fs.readFileSync(glb);
   const contentHash = createHash('sha256').update(bytes).digest('hex');
   const filename = path.basename(glb);
-  const body = publishBody(req, project, filename, contentHash);
+
+  // Provenance comes out of the same buffer that was just hashed, so what is
+  // declared and what is uploaded are the same bytes by construction. Done here
+  // rather than in the MCP server's inspection step because cli.ts inspects nothing.
+  //
+  // A container that will not parse is *not* an error here: validating the file is
+  // inspect_glb's job on this side and the processor's on the other, and failing a
+  // publish in this function over it would move that check somewhere it does not
+  // belong — and would refuse files this client has always been willing to send.
+  // An unreadable container simply carries no provenance.
+  const fromFile = readSourceFromGlb(tryParseGlb(bytes));
+  if (fromFile.error) {
+    // Refusing costs nothing; publishing anyway spends a revision number that can
+    // never be reused on a model whose provenance was silently thrown away.
+    throw new BadRequest(
+      `Refusing to publish: ${fromFile.error} Fix the exporter, or pass source explicitly to ` +
+        'override what the file says.',
+    );
+  }
+  for (const warning of fromFile.warnings) log.push(warning);
+  const source = resolveSource(req, fromFile.source, log);
+
+  const body = publishBody(req, project, filename, contentHash, source);
 
   if (cfg.dryRun) {
     return {
@@ -406,10 +483,11 @@ export async function publishModel(
       url: '',
       bytes: bytes.length,
       contentHash,
+      source,
       deduped: false,
       resumed: false,
       dryRun: true,
-      log: ['dry run: nothing was reserved, uploaded or published'],
+      log: [...log, 'dry run: nothing was reserved, uploaded or published'],
       verification: null,
       plannedRequest: { url: `${cfg.apiUrl}/publish`, body },
     };
@@ -508,12 +586,24 @@ export async function publishModel(
     url: reserved.url,
     bytes: bytes.length,
     contentHash,
+    // On a dedupe this is what was *offered*, not necessarily what the revision
+    // records — the API applies neither notes nor source to bytes it already has.
+    source,
     deduped,
     resumed,
     dryRun: false,
     log,
     verification,
   };
+}
+
+/** The glTF JSON, or an empty object when the container cannot be read at all. */
+function tryParseGlb(bytes: Buffer): unknown {
+  try {
+    return parseGlbContainer(bytes).json;
+  } catch {
+    return {};
+  }
 }
 
 /** The configured site URL, else the origin of the share URL the API returned. */

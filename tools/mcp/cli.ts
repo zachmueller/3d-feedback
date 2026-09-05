@@ -5,7 +5,11 @@
  *       [--title "Towel clip"] [--notes "raised the clip angle 5°"] \
  *       [--profile my-aws-profile] [--api-url https://…] [--site-url https://…] \
  *       [--region us-east-1] [--timeout 120] [--revision 4] [--force] \
- *       [--no-verify] [--quiet]
+ *       [--no-verify] [--quiet] [--source-* …]
+ *
+ * The --source-* flags override the provenance the .glb carries in
+ * asset.extras.source, which is read automatically and is the normal path. `--help`
+ * lists them.
  *
  * The share URL is the last line on stdout and the only thing there, so a workflow
  * can capture it directly:
@@ -42,9 +46,25 @@ const USAGE = `Publish a .glb as the next revision of a project and print its sh
   -q, --quiet          Progress off; the URL is still printed
   -h, --help           This text
 
+Recording where the model came from (normally unnecessary — a .glb that declares
+it in asset.extras.source is read automatically, and inside the file it cannot
+drift from the bytes it describes). These override the file:
+
+  --source-repo <name>       Repository identity, e.g. 3d-models
+  --source-clone-url <url>   https:// ssh:// git:// codecommit:: or user@host:path
+  --source-commit <oid>      The exact commit, 40 or 64 hex characters
+  --source-ref <name>        Branch or tag, e.g. main
+  --source-path <path>       The model's directory in the repo, repo-relative
+  --source-build <cmd>       The command that rebuilds it
+  --source-recreate <text>   One line telling a reviewer how to recreate it
+  --source-dirty             The working tree had uncommitted changes
+  --source-tree <oid>        git tree oid of what was built (use with --source-dirty)
+
 Publishing the same bytes twice is a no-op: the revision that already holds them
 is printed instead, because revision numbers are never reused and a retry should
-not spend one. Pass --force to publish them anyway.`;
+not spend one. Pass --force to publish them anyway. Note that a dedupe also drops
+an overridden --source-*, for the same reason it drops --notes: the bytes it would
+describe have not changed.`;
 
 interface Parsed {
   request: PublishRequest;
@@ -58,6 +78,9 @@ export function parseArgs(argv: string[]): Parsed {
   const overrides: Partial<Config> = {};
   let quiet = false;
   let file = '';
+  // Assembled field by field, then attached only if anything was given — an empty
+  // object would otherwise read as "override the file with nothing".
+  const source: Record<string, unknown> = {};
 
   const next = (flag: string, value: string | undefined): string => {
     if (value === undefined) throw new BadRequest(`${flag} needs a value`);
@@ -102,6 +125,33 @@ export function parseArgs(argv: string[]): Parsed {
       case '--force':
         request.force = true;
         break;
+      case '--source-repo':
+        source.repo = next(arg, argv[++i]);
+        break;
+      case '--source-clone-url':
+        source.cloneUrl = next(arg, argv[++i]);
+        break;
+      case '--source-commit':
+        source.commit = next(arg, argv[++i]);
+        break;
+      case '--source-ref':
+        source.ref = next(arg, argv[++i]);
+        break;
+      case '--source-path':
+        source.path = next(arg, argv[++i]);
+        break;
+      case '--source-build':
+        source.build = next(arg, argv[++i]);
+        break;
+      case '--source-recreate':
+        source.recreate = next(arg, argv[++i]);
+        break;
+      case '--source-tree':
+        source.tree = next(arg, argv[++i]);
+        break;
+      case '--source-dirty':
+        source.dirty = true;
+        break;
       case '--no-verify':
         request.verify = false;
         break;
@@ -118,6 +168,9 @@ export function parseArgs(argv: string[]): Parsed {
 
   if (!file) throw new BadRequest('pass the .glb file to publish');
   request.glb = file;
+  // Validation lives in normalizeSource, which publishModel reaches on the way to
+  // the request body, so a bad --source-commit fails with the API's own wording.
+  if (Object.keys(source).length) request.source = source;
   return { request, overrides, quiet };
 }
 

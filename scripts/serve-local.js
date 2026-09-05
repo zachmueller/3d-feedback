@@ -50,6 +50,8 @@ const fixtures = {
       title: 'Sample bracket',
       latest: 2,
       revisions: [
+        // Revision 1 records no provenance, the way every revision published before
+        // it existed does — so the "Built from" card must stay hidden here.
         {
           rev: 1,
           publishedAt,
@@ -57,12 +59,28 @@ const fixtures = {
           bytes: fs.statSync(samplePath).size,
           commentCount: 1,
         },
+        // Revision 2 records one, including the dirty case, which is the interesting
+        // rendering: a commit alone does not identify what was built.
         {
           rev: 2,
           publishedAt: new Date('2026-08-24T09:30:00Z').toISOString(),
           notes: 'Taller arm so the towel does not slip off.',
           bytes: fs.statSync(samplePath).size,
           commentCount: 0,
+          source: {
+            schema: '3d-feedback/source@1',
+            repo: '3d-models',
+            cloneUrl: 'https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models',
+            commit: '7dd5ecd' + '0'.repeat(33),
+            ref: 'main',
+            dirty: true,
+            tree: 'a1b2c3d' + '4'.repeat(33),
+            path: 'models/sample-clip',
+            build: 'make sample-clip',
+            recreate:
+              'git clone https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models && ' +
+              'cd 3d-models && git checkout 7dd5ecd && make sample-clip',
+          },
         },
       ],
     },

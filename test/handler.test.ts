@@ -18,6 +18,11 @@ import {
   computeLatest,
   reserveRevision,
   normalizeContentHash,
+  normalizeSource,
+  SOURCE_SCHEMA,
+  MAX_SOURCE_BUILD_LEN,
+  MAX_SOURCE_RECREATE_LEN,
+  MAX_SOURCE_REPO_LEN,
   findDuplicateRevision,
   revisionForResume,
   buildManifest,
@@ -41,6 +46,19 @@ const NOW = '2026-08-25T12:00:00.000Z';
 /** Two distinct sha256 digests, as a publisher would declare them. */
 const HASH_A = 'a'.repeat(64);
 const HASH_B = `${'b'.repeat(63)}9`;
+
+/** A sha1 commit and tree, as git writes them. */
+const COMMIT = `${'a'.repeat(39)}1`;
+const TREE = `${'b'.repeat(39)}2`;
+
+/** The provenance a producer declares, before validation. */
+const SOURCE = {
+  schema: '3d-feedback/source@1',
+  repo: '3d-models',
+  commit: COMMIT,
+  path: 'models/cloth-basket-small',
+  build: 'make cloth-basket-small',
+};
 
 function glbHeader(version = 2, magic = 'glTF'): Uint8Array {
   const bytes = new Uint8Array(12);
@@ -274,6 +292,155 @@ describe('reserveRevision', () => {
     reserveRevision(meta, 'towel-clip', { now: NOW, contentHash: HASH_A });
     expect(meta.projects['towel-clip'].revisions['1'].contentHash).toBe(HASH_A);
   });
+
+  it('records the source provenance it was given', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW, source: normalizeSource(SOURCE) });
+    expect(meta.projects['towel-clip'].revisions['1'].source).toEqual({
+      schema: SOURCE_SCHEMA,
+      repo: '3d-models',
+      commit: COMMIT,
+      path: 'models/cloth-basket-small',
+      build: 'make cloth-basket-small',
+    });
+  });
+
+  it('leaves the source null when none is given', () => {
+    const meta = emptyMetadata();
+    reserveRevision(meta, 'towel-clip', { now: NOW });
+    expect(meta.projects['towel-clip'].revisions['1'].source).toBeNull();
+  });
+});
+
+// --- source provenance -------------------------------------------------------
+
+describe('normalizeSource', () => {
+  it('treats absent as "not declared"', () => {
+    expect(normalizeSource(undefined)).toBeNull();
+    expect(normalizeSource(null)).toBeNull();
+  });
+
+  // A schema and nothing else describes nothing; recording it would put an empty
+  // object into every manifest for no reader's benefit.
+  it('treats a record with no field that has a value as "not declared"', () => {
+    expect(normalizeSource({})).toBeNull();
+    expect(normalizeSource({ schema: SOURCE_SCHEMA })).toBeNull();
+    expect(normalizeSource({ schema: SOURCE_SCHEMA, repo: '   ', commit: '' })).toBeNull();
+  });
+
+  it('keeps the fields the contract defines and stamps the schema', () => {
+    expect(normalizeSource({ repo: '3d-models', ref: 'main' })).toEqual({
+      schema: SOURCE_SCHEMA,
+      repo: '3d-models',
+      ref: 'main',
+    });
+  });
+
+  // Forward compatibility: a producer sending a field this deployment predates must
+  // not have its whole record rejected.
+  it('drops keys the contract does not define', () => {
+    const source = normalizeSource({ repo: '3d-models', builtAt: 'now', nonsense: 1 });
+    expect(source).toEqual({ schema: SOURCE_SCHEMA, repo: '3d-models' });
+  });
+
+  it('accepts a sha1 or a sha256 git oid, however cased', () => {
+    expect(normalizeSource({ commit: COMMIT.toUpperCase() })?.commit).toBe(COMMIT);
+    expect(normalizeSource({ commit: 'c'.repeat(64) })?.commit).toBe('c'.repeat(64));
+    expect(normalizeSource({ tree: TREE })?.tree).toBe(TREE);
+  });
+
+  it.each([
+    ['deadbeef', 'too short'],
+    [`${COMMIT}00`, 'neither length'],
+    [COMMIT.replace('a', 'z'), 'not hex'],
+  ])('rejects commit %s (%s)', (commit) => {
+    expect(() => normalizeSource({ commit })).toThrow(/source\.commit must be a git object id/);
+  });
+
+  it('names the field it rejected, so tree and commit are distinguishable', () => {
+    expect(() => normalizeSource({ tree: 'nope' })).toThrow(/source\.tree/);
+  });
+
+  it('records dirty only when it is true', () => {
+    expect(normalizeSource({ repo: 'r', dirty: true })?.dirty).toBe(true);
+    expect(normalizeSource({ repo: 'r', dirty: 'true' })?.dirty).toBe(true);
+    expect(normalizeSource({ repo: 'r', dirty: false })).not.toHaveProperty('dirty');
+    expect(normalizeSource({ repo: 'r' })).not.toHaveProperty('dirty');
+  });
+
+  it('caps every string at its own limit', () => {
+    const source = normalizeSource({
+      repo: 'r'.repeat(MAX_SOURCE_REPO_LEN + 50),
+      build: 'b'.repeat(MAX_SOURCE_BUILD_LEN + 50),
+      recreate: 'x'.repeat(MAX_SOURCE_RECREATE_LEN + 500),
+    });
+    expect(source?.repo).toHaveLength(MAX_SOURCE_REPO_LEN);
+    expect(source?.build).toHaveLength(MAX_SOURCE_BUILD_LEN);
+    expect(source?.recreate).toHaveLength(MAX_SOURCE_RECREATE_LEN);
+  });
+
+  // It lands on a public page, so it goes through the same sanitizer as a comment.
+  it('strips control characters and normalizes newlines', () => {
+    const source = normalizeSource({ recreate: 'git clone x\r\nmake y ' });
+    expect(source?.recreate).toBe('git clone x\nmake y');
+  });
+
+  it('rejects a schema it does not understand', () => {
+    expect(() => normalizeSource({ schema: '3d-feedback/source@2', repo: 'r' })).toThrow(
+      /source\.schema must be/,
+    );
+  });
+
+  // On the wire the schema is optional — a human passing --source-commit is not
+  // going to type one — and gets stamped with the current version.
+  it('accepts a record with no schema and stamps the current one', () => {
+    expect(normalizeSource({ repo: '3d-models' })?.schema).toBe(SOURCE_SCHEMA);
+  });
+
+  it.each([
+    ['/etc/passwd', 'absolute'],
+    ['../../secrets', 'escapes the repo'],
+    ['models/../../etc', 'escapes mid-path'],
+    ['models\\win', 'backslash'],
+  ])('rejects path %s (%s)', (path) => {
+    expect(() => normalizeSource({ path })).toThrow(/repository-relative POSIX path/);
+  });
+
+  it('accepts an ordinary repo-relative path', () => {
+    expect(normalizeSource({ path: 'models/cloth-basket-small' })?.path).toBe(
+      'models/cloth-basket-small',
+    );
+  });
+
+  it.each([
+    'https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models',
+    'http://git.internal/3d-models.git',
+    'ssh://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models',
+    'git://example.com/3d-models.git',
+    'codecommit::us-east-1://3d-models',
+    'git@github.com:zach/3d-models.git',
+  ])('accepts clone URL %s', (cloneUrl) => {
+    expect(normalizeSource({ cloneUrl })?.cloneUrl).toBe(cloneUrl);
+  });
+
+  // The viewer renders this as text and never as an href; the allowlist is what
+  // keeps that true by construction rather than by everyone downstream remembering.
+  it.each([
+    'javascript:alert(1)',
+    'data:text/html,<script>',
+    'file:///etc/passwd',
+    'not a url at all',
+    // A valid scheme is not enough: sanitizeText trims the ends but keeps the middle.
+    'https://example.com/a repo.git',
+  ])('rejects clone URL %s', (cloneUrl) => {
+    expect(() => normalizeSource({ cloneUrl })).toThrow(/source\.cloneUrl must be a clone URL/);
+  });
+
+  it('rejects a non-object', () => {
+    for (const input of ['a string', 42, ['an', 'array']]) {
+      expect(() => normalizeSource(input)).toThrow(/source must be an object/);
+    }
+  });
 });
 
 // --- retry safety -----------------------------------------------------------
@@ -341,6 +508,27 @@ describe('findDuplicateRevision', () => {
     const meta = emptyMetadata();
     reserveRevision(meta, 'towel-clip', { now: NOW, contentHash: HASH_A });
     expect(findDuplicateRevision(meta.projects['towel-clip'], HASH_A)).toBeNull();
+  });
+
+  /**
+   * The dedupe keys on the content hash alone, and declaring a different source
+   * does not change that — so the same bytes with a new commit resolve to the
+   * revision that already holds them and the new provenance is dropped, exactly as
+   * a new title or new notes would be.
+   *
+   * This is pinned rather than fixed because it is the reason provenance travels
+   * *inside* the .glb: extras are part of the bytes, so a rebuild from a different
+   * commit is a different hash and never reaches this path at all. Only an explicit
+   * `source` override can, and --force is the way out of it.
+   */
+  it('still matches on the hash alone when the declared source differs', () => {
+    const meta = projectWith(1);
+    const project = meta.projects['towel-clip'];
+    project.revisions['1'].contentHash = HASH_A;
+    project.revisions['1'].source = normalizeSource({ ...SOURCE, commit: COMMIT });
+    // A publish of identical bytes that claims a different commit.
+    expect(findDuplicateRevision(project, HASH_A)?.rev).toBe(1);
+    expect(findDuplicateRevision(project, HASH_A)?.source?.commit).toBe(COMMIT);
   });
 });
 
@@ -422,6 +610,29 @@ describe('buildManifest', () => {
       notes: 'wider hook',
       bytes: 2048,
       commentCount: 2,
+    });
+  });
+
+  // Every revision published before provenance existed carries none, and this
+  // manifest is fetched on every share-page load — so the absent case has to produce
+  // exactly the object it did before, not one with `source: null` bolted on. The
+  // assertion above ("nothing more") is the other half of this.
+  it('emits no source key at all for a revision that recorded none', () => {
+    const meta = projectWith(1);
+    const [revision] = buildManifest(meta.projects['towel-clip']).revisions;
+    expect(revision).not.toHaveProperty('source');
+  });
+
+  it('carries the source provenance through to the viewer when there is one', () => {
+    const meta = projectWith(1);
+    meta.projects['towel-clip'].revisions['1'].source = normalizeSource(SOURCE);
+    const [revision] = buildManifest(meta.projects['towel-clip']).revisions;
+    expect(revision.source).toEqual({
+      schema: SOURCE_SCHEMA,
+      repo: '3d-models',
+      commit: COMMIT,
+      path: 'models/cloth-basket-small',
+      build: 'make cloth-basket-small',
     });
   });
 
@@ -568,6 +779,17 @@ describe('request authorization', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(JSON.parse(res.body).error).toMatch(/reserved/);
+  });
+
+  // Proves normalizeSource runs inside the publish path, before any S3 access — so
+  // a malformed provenance record is the caller's 400 rather than an internal 500.
+  it('answers a malformed source with a 400 naming the field', async () => {
+    const res = await handler({
+      requestContext: { http: { path: '/publish' } },
+      body: JSON.stringify({ project: 'towel-clip', source: { commit: 'not-a-commit' } }),
+    });
+    expect(res.statusCode).toBe(400);
+    expect(JSON.parse(res.body).error).toMatch(/source\.commit must be a git object id/);
   });
 
   it('keeps internal failures generic instead of leaking configuration', async () => {

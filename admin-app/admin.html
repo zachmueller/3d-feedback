@@ -79,6 +79,26 @@
       return ` <span class="pill ${kind}"${title}>${escapeHtml(rev.status)}</span>`;
     }
 
+    // Provenance is shown here but never edited: it is a mechanical claim about
+    // bytes that are immutable, so a hand-typed correction would be an assertion
+    // nobody could check against the model. The remedy for a wrong one is a new
+    // revision, the same as for wrong geometry. Notes and the title stay editable
+    // because they are prose, meant to be revised.
+    function sourceLine(rev) {
+      const s = rev.source;
+      if (!s) return '';
+      const where = [s.repo, s.path].filter(Boolean).join('/');
+      const parts = [
+        where,
+        s.commit ? s.commit.slice(0, 12) : '',
+        s.dirty ? 'dirty' : '',
+        s.build || '',
+      ].filter(Boolean);
+      if (!parts.length) return '';
+      const full = s.recreate || parts.join(' · ');
+      return `<div class="meta mono" title="${escapeHtml(full)}">built from ${escapeHtml(parts.join(' · '))}</div>`;
+    }
+
     function revisionRow(project, rev) {
       const url = shareUrl(cfg, project.slug, rev.rev);
       // A revision that never finished processing has no page to link to.
@@ -100,6 +120,7 @@
         </div>
         <div class="note">${escapeHtml(rev.notes || 'No notes.')}</div>
         <div class="meta mono">${escapeHtml(fmtDate(rev.publishedAt || rev.reservedAt))} · ${escapeHtml(fmtBytes(rev.bytes))}</div>
+        ${sourceLine(rev)}
       </li>`;
     }
 

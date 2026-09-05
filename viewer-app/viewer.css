@@ -292,6 +292,38 @@ html, body {
 
 .empty { color: var(--muted); margin: 0; }
 
+/* --- provenance ----------------------------------------------------------- */
+
+/* Commits, paths and clone URLs read as identifiers, not prose. */
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+
+#revRecreate {
+  /* The line a reviewer copies, so it wraps rather than truncating. */
+  overflow-wrap: anywhere;
+}
+
+#revSource {
+  display: grid;
+  /* Labels size to their content; values take the rest and truncate. */
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 2px 12px;
+  margin: 10px 0 0;
+}
+
+#revSource dt { color: var(--muted); }
+
+#revSource dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+#revDownloads a { color: inherit; }
+
 /* --- comments ------------------------------------------------------------- */
 
 #comments {

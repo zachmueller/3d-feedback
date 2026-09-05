@@ -44,7 +44,32 @@ const binary = Buffer.concat([
 // The nodes share one mesh geometry but use different materials and transforms,
 // which is the shape a small FreeCAD assembly arrives in.
 const gltf = {
-  asset: { version: '2.0', generator: '3d-feedback make-sample-glb' },
+  asset: {
+    version: '2.0',
+    generator: '3d-feedback make-sample-glb',
+    // How a producer declares where a model came from — see README, "Recording
+    // where a model came from". Included here so `inspect_glb`, the stdio smoke
+    // test and the dev server all exercise the read path without a real producer.
+    //
+    // Note what is absent: no build timestamp, no absolute path, no hostname. Every
+    // value is a function of the git state, so rebuilding the same commit produces
+    // byte-identical output — which is what keeps the API's identical-bytes dedupe
+    // (the whole retry-safety story) working.
+    extras: {
+      source: {
+        schema: '3d-feedback/source@1',
+        repo: '3d-models',
+        cloneUrl: 'https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models',
+        commit: '0'.repeat(39) + '1',
+        ref: 'main',
+        path: 'models/sample-clip',
+        build: 'make sample-clip',
+        recreate:
+          'git clone https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models && ' +
+          'cd 3d-models && git checkout ' + '0'.repeat(39) + '1' + ' && make sample-clip',
+      },
+    },
+  },
   scene: 0,
   scenes: [{ nodes: [0, 1, 2] }],
   nodes: [

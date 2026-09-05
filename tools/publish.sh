@@ -6,7 +6,11 @@
 #       [--title "Towel clip"] [--notes "raised the clip angle 5°"] \
 #       [--profile my-aws-profile] [--api-url https://…] [--site-url https://…] \
 #       [--region us-east-1] [--timeout 120] [--revision 4] [--force] \
-#       [--no-verify] [--quiet]
+#       [--no-verify] [--quiet] [--source-* …]
+#
+# A .glb that records where it was built from (asset.extras.source) has that
+# provenance published with the revision automatically; the --source-* flags are the
+# override for an export that carries none. `--help` lists them.
 #
 # The URL is printed on stdout as the last line and nothing else goes there, so a
 # workflow can capture it directly:

@@ -397,6 +397,80 @@ function wireCommentForm(config, slug, rev) {
   });
 }
 
+// --- provenance -------------------------------------------------------------
+
+/**
+ * Show where this revision was built from.
+ *
+ * Everything rendered here arrives in the public manifest, so it is untrusted text
+ * exactly like a comment: values go in with `textContent` on created elements, never
+ * as markup. The one field that looks like it wants to be a link — `cloneUrl` — is
+ * deliberately rendered as plain text. It is a clone URL, not a page a reviewer
+ * would click, and keeping it out of an `href` means no manifest value can ever
+ * become a navigable URL here.
+ *
+ * The API caps and sanitizes each field (normalizeSource in the Lambda); this only
+ * has to lay them out.
+ */
+function renderSource(source) {
+  const section = el('sourceInfo');
+  if (!source) return;
+
+  const recreate = el('revRecreate');
+  if (source.recreate) {
+    recreate.textContent = source.recreate;
+  } else {
+    hide(recreate);
+  }
+
+  // Ordered most to least useful to someone trying to get the source back.
+  const rows = [];
+  if (source.repo) rows.push(['Repository', source.repo]);
+  if (source.path) rows.push(['Path', source.path]);
+  if (source.commit) rows.push(['Commit', source.commit]);
+  if (source.ref) rows.push(['Branch or tag', source.ref]);
+  if (source.build) rows.push(['Rebuild with', source.build]);
+  if (source.cloneUrl) rows.push(['Clone from', source.cloneUrl]);
+  if (source.dirty) {
+    // Said in words, not as a bare "true": it is the one field that tells a reviewer
+    // the commit alone does not identify what they are looking at.
+    rows.push([
+      'Uncommitted changes',
+      source.tree
+        ? `Yes — built from tree ${source.tree}, not from the commit as published`
+        : 'Yes — the working tree had changes that are not in the commit',
+    ]);
+  }
+
+  const list = el('revSource');
+  for (const [label, value] of rows) {
+    const dt = document.createElement('dt');
+    dt.textContent = label;
+    const dd = document.createElement('dd');
+    dd.textContent = value;
+    dd.className = 'mono';
+    // Long commits and URLs truncate in the layout; the full value stays reachable.
+    dd.title = value;
+    list.append(dt, dd);
+  }
+  if (!rows.length) hide(list);
+
+  if (source.recreate || rows.length) show(section);
+}
+
+/**
+ * The model download. Its href is composed from the path rather than taken from the
+ * manifest, so it cannot be influenced by published data; the file is already public
+ * at this URL, so this only saves a reviewer from having to know that.
+ */
+function renderDownloads(slug, rev, bytes) {
+  const link = document.createElement('a');
+  link.href = `/${encodeURIComponent(slug)}/${rev}/model.glb`;
+  link.setAttribute('download', `${slug}-rev${rev}.glb`);
+  link.textContent = `Download model (.glb${bytes ? `, ${fmtBytes(bytes)}` : ''})`;
+  el('revDownloads').append(link);
+}
+
 // --- revision navigation ----------------------------------------------------
 
 function wireRevisionNav(slug, revisions, index) {
@@ -488,6 +562,8 @@ async function main() {
   ]
     .filter(Boolean)
     .join(' · ');
+  renderDownloads(slug, rev, current.bytes);
+  renderSource(current.source);
   show(el('topbar'));
   show(el('below'));
   wireRevisionNav(slug, revisions, index);

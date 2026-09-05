@@ -26,6 +26,7 @@ import {
   manifestKey,
   modelKey,
   type RevisionStatus,
+  type SourceProvenance,
   statusKey,
 } from '../../lib/lambda/handler';
 
@@ -76,6 +77,12 @@ export interface StatusObject {
   revision: number;
   url?: string;
   error?: string;
+  /**
+   * Where the revision was built from. Written by the processor when it flips a
+   * revision to ready, so it is absent while a publish is still processing and on
+   * one that failed — the manifest is the other place to read it.
+   */
+  source?: SourceProvenance;
 }
 
 async function getJson<T>(reader: SiteReader, path: string, what: string): Promise<T | null> {
@@ -129,8 +136,16 @@ export const modelUrlFor = (siteUrl: string, slug: string, rev: number): string 
 /** What a status object means for the caller who was waiting on it. */
 export function describeStatus(status: StatusObject, siteUrl: string): string {
   switch (status.status) {
-    case 'ready':
-      return `Revision ${status.revision} is published: ${status.url ?? shareUrlFor(siteUrl, status.project, status.revision)}`;
+    case 'ready': {
+      const built = status.source?.commit
+        ? `, built from ${status.source.commit.slice(0, 12)}` +
+          `${status.source.dirty ? ' with uncommitted changes' : ''}`
+        : '';
+      return (
+        `Revision ${status.revision} is published${built}: ` +
+        `${status.url ?? shareUrlFor(siteUrl, status.project, status.revision)}`
+      );
+    }
     case 'error':
       return (
         `Revision ${status.revision} failed to process: ${status.error ?? 'no reason recorded'}. ` +
@@ -154,6 +169,8 @@ export interface RevisionSummary {
   bytes: number | null;
   commentCount: number;
   isLatest: boolean;
+  /** Where it was built from, when the revision recorded it. */
+  source: SourceProvenance | null;
 }
 
 export interface ProjectReport {
@@ -181,6 +198,7 @@ export function projectReport(manifest: Manifest, siteUrl: string): ProjectRepor
       bytes: r.bytes,
       commentCount: r.commentCount,
       isLatest: r.rev === manifest.latest,
+      source: r.source ?? null,
     })),
   };
 }

@@ -80,6 +80,27 @@ export const SLUG_RE = /^[a-z0-9](?:[a-z0-9-]{0,62}[a-z0-9])?$/;
 export const CONTENT_HASH_RE = /^[0-9a-f]{64}$/;
 
 /**
+ * A git object id: sha1 today, sha256 in a repository that opted into it. Both
+ * are accepted so the contract does not have to change when a producer migrates.
+ */
+export const GIT_OID_RE = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+
+/**
+ * Version of the source-provenance contract (README, "Recording where a model
+ * came from"). It is the discriminator that makes `asset.extras.source` in a .glb
+ * safely ours: extras carrying anything else belong to some other tool and are
+ * ignored rather than guessed at.
+ */
+export const SOURCE_SCHEMA = '3d-feedback/source@1';
+
+/**
+ * Clone URLs a reader could actually use. This is an allowlist rather than a
+ * denylist because the value lands in a public manifest and is rendered on a
+ * public page — see the note in normalizeSource about why it is never an href.
+ */
+const CLONE_URL_RE = /^(?:https?:\/\/|ssh:\/\/|git:\/\/|codecommit::|[A-Za-z0-9._-]+@[A-Za-z0-9.-]+:)\S/;
+
+/**
  * Ceiling on the uploaded model. A presigned PUT has no size limit of its own,
  * so the processor re-checks the object size from the S3 event. iOS Safari is
  * the real constraint at view time — a model near this cap will struggle there.
@@ -88,6 +109,17 @@ export const MAX_MODEL_BYTES = 100 * 1024 * 1024; // 100 MB
 
 export const MAX_TITLE_LEN = 120;
 export const MAX_NOTES_LEN = 2000;
+/**
+ * Caps on the source-provenance strings. Every one of them reaches the public
+ * manifest and a public page, so each is capped individually rather than trusting
+ * a producer to be reasonable; the sum is the ~1.6 KB a revision can add.
+ */
+export const MAX_SOURCE_REPO_LEN = 100;
+export const MAX_SOURCE_URL_LEN = 400;
+export const MAX_SOURCE_REF_LEN = 200;
+export const MAX_SOURCE_PATH_LEN = 200;
+export const MAX_SOURCE_BUILD_LEN = 200;
+export const MAX_SOURCE_RECREATE_LEN = 600;
 export const MAX_COMMENT_NAME_LEN = 60;
 export const MAX_COMMENT_TEXT_LEN = 4000;
 /** Per-revision thread cap; the endpoint is public, so it needs a ceiling. */
@@ -114,6 +146,38 @@ const cloudfront = (): CloudFrontClient => (_cf ??= new CloudFrontClient({}));
 
 export type RevisionStatus = 'processing' | 'ready' | 'error';
 
+/**
+ * Where a revision's model came from, so a reviewer can obtain the source and
+ * rebuild it. Every field is optional; a revision with none is normal (nothing
+ * published before this existed carries any, and a FreeCAD export carries none).
+ *
+ * It normally travels *inside* the .glb, in `asset.extras.source`, and the publish
+ * client forwards it from there — see the contract in README, "Recording where a
+ * model came from", and normalizeSource below for what survives validation.
+ */
+export interface SourceProvenance {
+  /** Contract version; always SOURCE_SCHEMA once normalized. */
+  schema: string;
+  /** Repository identity — a short name like `3d-models`, not a URL. */
+  repo?: string;
+  /** Where to get it, when a usable URL exists. */
+  cloneUrl?: string;
+  /** The exact commit, as a git object id. */
+  commit?: string;
+  /** Branch or tag it was built from. Not a substitute for `commit`. */
+  ref?: string;
+  /** The working tree had uncommitted changes; omitted when it did not. */
+  dirty?: boolean;
+  /** git tree oid of what was actually built — the hash that stands in for a diff. */
+  tree?: string;
+  /** The model's directory within the repository. */
+  path?: string;
+  /** The command that rebuilds it. */
+  build?: string;
+  /** The one line a reviewer reads. Displayed only; nothing here executes it. */
+  recreate?: string;
+}
+
 export interface RevisionEntry {
   rev: number;
   status: RevisionStatus;
@@ -126,6 +190,8 @@ export interface RevisionEntry {
   error?: string;
   /** sha256 the publisher declared for the model; see normalizeContentHash. */
   contentHash?: string | null;
+  /** Where the model was built from; see normalizeSource. */
+  source?: SourceProvenance | null;
 }
 
 export interface ProjectEntry {
@@ -159,6 +225,8 @@ export interface Manifest {
     notes: string | null;
     bytes: number | null;
     commentCount: number;
+    /** Present only when the revision recorded one; see buildManifest. */
+    source?: SourceProvenance;
   }>;
 }
 
@@ -217,6 +285,113 @@ export function normalizeContentHash(input: unknown): string | null {
     throw new BadRequest('contentHash must be a sha256 digest as 64 hexadecimal characters');
   }
   return hash;
+}
+
+/**
+ * `{ key: value }` when there is a value, `{}` when there is not — so a field with
+ * nothing in it is absent from the record rather than present as null. Spread.
+ */
+function maybe<K extends string, V>(key: K, value: V | null | undefined): Record<K, V> | object {
+  return value === undefined || value === null ? {} : ({ [key]: value } as Record<K, V>);
+}
+
+/** A git object id, or null. Throws with the field's name so the fix is obvious. */
+function optionalGitOid(value: unknown, field: string): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  const oid = String(value).trim().toLowerCase();
+  if (!oid) return undefined;
+  if (!GIT_OID_RE.test(oid)) {
+    throw new BadRequest(
+      `source.${field} must be a git object id — 40 (sha1) or 64 (sha256) hexadecimal characters`,
+    );
+  }
+  return oid;
+}
+
+/**
+ * Validate the provenance a publisher declares for the model: which repository,
+ * which commit, where in it, and how to rebuild it.
+ *
+ * Wholly optional, and unknown keys are dropped rather than rejected, so a
+ * producer can start sending a field this deployment predates without breaking.
+ * What is *not* tolerated is a malformed value that would be rendered as if it
+ * were a fact: a commit id that is not one, a path that escapes the repository, a
+ * clone URL with a scheme nobody could clone from.
+ *
+ * Two properties this deliberately does not have:
+ *
+ *  - **It does not verify anything.** Nothing here can check that the commit
+ *    exists or that it produced these bytes. The protection is upstream: the
+ *    provenance normally travels inside the .glb, so it is a function of the exact
+ *    bytes being published rather than an independent claim about them.
+ *  - **It never stores a diff.** Uncommitted work is a `dirty` flag plus a `tree`
+ *    hash, because this lands in a public, unbounded-by-nothing manifest.
+ *
+ * Every string goes through sanitizeText and a MAX_SOURCE_* cap: this reaches a
+ * public page, so it is untrusted input even though only an IAM-authorized caller
+ * can send it. `cloneUrl` gets a scheme allowlist on top — the viewer renders it as
+ * text and never as a link, and the allowlist means that stays true by construction
+ * rather than by everyone downstream remembering.
+ */
+export function normalizeSource(input: unknown): SourceProvenance | null {
+  if (input === undefined || input === null) return null;
+  if (typeof input !== 'object' || Array.isArray(input)) {
+    throw new BadRequest('source must be an object');
+  }
+  const raw = input as Record<string, unknown>;
+
+  // A schema is required inside a .glb (the client checks it there, where a
+  // mismatch means the extras are somebody else's); on the wire it is optional,
+  // because a human passing --source-commit will not be typing one.
+  if (raw.schema !== undefined && raw.schema !== null && String(raw.schema).trim()) {
+    if (String(raw.schema).trim() !== SOURCE_SCHEMA) {
+      throw new BadRequest(
+        `source.schema must be "${SOURCE_SCHEMA}"; this deployment does not understand ` +
+          `"${sanitizeText(raw.schema, 60)}"`,
+      );
+    }
+  }
+
+  const path = optionalText(raw.path, MAX_SOURCE_PATH_LEN);
+  if (path !== null) {
+    if (path.startsWith('/') || path.includes('\\') || path.split('/').includes('..')) {
+      throw new BadRequest(
+        'source.path must be a repository-relative POSIX path: no leading slash, no ".." ' +
+          'segment, no backslash',
+      );
+    }
+  }
+
+  const cloneUrl = optionalText(raw.cloneUrl, MAX_SOURCE_URL_LEN);
+  // Whitespace is checked separately from the scheme: sanitizeText trims the ends
+  // but keeps the middle, and a URL with a space in it is not one.
+  if (cloneUrl !== null && (/\s/.test(cloneUrl) || !CLONE_URL_RE.test(cloneUrl))) {
+    throw new BadRequest(
+      'source.cloneUrl must be a clone URL — https://, http://, ssh://, git://, codecommit:: ' +
+        'or user@host:path — with no whitespace',
+    );
+  }
+
+  // Only the fields that have a value are written, so an absent one is absent from
+  // the manifest rather than present as null.
+  const source: SourceProvenance = {
+    schema: SOURCE_SCHEMA,
+    ...maybe('repo', optionalText(raw.repo, MAX_SOURCE_REPO_LEN)),
+    ...maybe('cloneUrl', cloneUrl),
+    ...maybe('commit', optionalGitOid(raw.commit, 'commit')),
+    ...maybe('ref', optionalText(raw.ref, MAX_SOURCE_REF_LEN)),
+    ...maybe('tree', optionalGitOid(raw.tree, 'tree')),
+    ...maybe('path', path),
+    ...maybe('build', optionalText(raw.build, MAX_SOURCE_BUILD_LEN)),
+    ...maybe('recreate', optionalText(raw.recreate, MAX_SOURCE_RECREATE_LEN)),
+    // `dirty` is recorded only when true: a false on every clean build is noise, and
+    // its absence already means "not known to have been dirty".
+    ...(raw.dirty === true || raw.dirty === 'true' ? { dirty: true } : {}),
+  };
+
+  // A schema and nothing else describes nothing, so it is the same as no source at
+  // all — which keeps `source: {}` from putting an empty object in every manifest.
+  return Object.keys(source).length > 1 ? source : null;
 }
 
 /** Parse a revision number: a positive integer, however it arrived. */
@@ -304,6 +479,7 @@ export function reserveRevision(
     notes?: string | null;
     filename?: string | null;
     contentHash?: string | null;
+    source?: SourceProvenance | null;
     now: string;
   },
 ): number {
@@ -318,6 +494,7 @@ export function reserveRevision(
     filename: opts.filename ?? null,
     reservedAt: opts.now,
     contentHash: opts.contentHash ?? null,
+    source: opts.source ?? null,
   };
   return rev;
 }
@@ -379,7 +556,14 @@ export function revisionForResume(project: ProjectEntry, rev: number): ResumeChe
   return { ok: true, entry };
 }
 
-/** Project the private index down to what the viewer is allowed to see. */
+/**
+ * Project the private index down to what the viewer is allowed to see.
+ *
+ * `source` is spread in only when the revision has one, rather than emitted as
+ * `null`. Every published revision predates provenance, and this manifest is
+ * fetched on every share-page load — so an absent source produces byte-identical
+ * output to before, and "backward compatible" is literal rather than nominal.
+ */
 export function buildManifest(project: ProjectEntry): Manifest {
   const revisions = Object.values(project.revisions)
     .filter((r) => r.status === 'ready')
@@ -390,6 +574,7 @@ export function buildManifest(project: ProjectEntry): Manifest {
       notes: r.notes ?? null,
       bytes: r.bytes ?? null,
       commentCount: r.commentCount ?? 0,
+      ...(r.source ? { source: r.source } : {}),
     }));
   return {
     slug: project.slug,
@@ -699,6 +884,7 @@ async function handleS3Event(event: any): Promise<void> {
 
       // Flip the revision to ready and recompute the project's latest pointer.
       let project: ProjectEntry | undefined;
+      let source: SourceProvenance | null = null;
       await mutateMetadata((meta) => {
         const proj = meta.projects[slug];
         if (!proj) throw new Error(`Unknown project "${slug}" — publish was not reserved.`);
@@ -710,6 +896,7 @@ async function handleS3Event(event: any): Promise<void> {
         entry.commentCount ??= 0;
         proj.latest = computeLatest(proj);
         project = proj;
+        source = entry.source ?? null;
       });
 
       // The viewer needs the manifest before the URL is usable, so publish it
@@ -725,10 +912,19 @@ async function handleS3Event(event: any): Promise<void> {
         await writeJson(assets, commentsKey(slug, rev), { comments: [] }, LIVE_CACHE);
       }
 
+      // The provenance rides along here, from the same metadata entry the manifest
+      // is built from, so `get_publish_status` can answer "what commit was this?"
+      // without a second fetch and without a second source of truth.
       await writeJson(
         assets,
         statusKey(slug, rev),
-        { status: 'ready', project: slug, revision: rev, url: shareUrl(slug, rev) },
+        {
+          status: 'ready',
+          project: slug,
+          revision: rev,
+          url: shareUrl(slug, rev),
+          ...(source ? { source } : {}),
+        },
         NO_CACHE,
       );
     } catch (err) {
@@ -804,6 +1000,13 @@ export function actionFromPath(event: any): string {
  *   revision     Re-presign an upload for a revision that was already reserved
  *                but never finished, instead of taking a new number.
  *
+ * And one that records where the model came from:
+ *
+ *   source       Repository, commit, path and rebuild command (normalizeSource).
+ *                Normally the publish client lifts this straight out of the .glb's
+ *                `asset.extras.source`, so it cannot drift from the bytes it
+ *                describes; passing it here overrides the file.
+ *
  * ContentType is deliberately left out of the signed request so a plain
  * `curl -T` (which sends application/octet-stream) still matches the signature;
  * the processor sets the real Content-Type when it copies the object.
@@ -817,6 +1020,7 @@ async function actionPublish(event: any) {
   const notes = optionalText(body.notes ?? body.revisionNotes, MAX_NOTES_LEN);
   const filename = sanitizeFilename(body.filename);
   const contentHash = normalizeContentHash(body.contentHash);
+  const source = normalizeSource(body.source);
   const force = body.force === true || body.force === 'true';
   const resuming = body.revision !== undefined && body.revision !== null;
   const resumeRev = resuming ? parseRevision(body.revision) : null;
@@ -845,8 +1049,12 @@ async function actionPublish(event: any) {
         statusUrl: `${siteUrl()}/${statusKey(slug, duplicate.rev)}`,
         deduped: true,
         publishedAt: duplicate.publishedAt ?? null,
-        // No uploadUrl: there is nothing to upload. Title and notes are not
-        // applied either — an existing revision's text is edited from /admin.
+        // No uploadUrl: there is nothing to upload. Title, notes and source are not
+        // applied either — an existing revision's text is edited from /admin, and
+        // its provenance describes bytes that have not changed. That last one is
+        // only reachable by overriding `source` explicitly: when it comes from
+        // inside the .glb, a different commit is different bytes and never lands
+        // here at all.
         message:
           `Revision ${duplicate.rev} already holds these exact bytes; nothing was published. ` +
           'Pass force to publish them again as a new revision.',
@@ -857,7 +1065,7 @@ async function actionPublish(event: any) {
   let rev = resumeRev ?? 0;
   await mutateMetadata((meta) => {
     if (resumeRev === null) {
-      rev = reserveRevision(meta, slug, { title, notes, filename, contentHash, now });
+      rev = reserveRevision(meta, slug, { title, notes, filename, contentHash, source, now });
       return;
     }
     // Resume: the same number, back to processing, with whatever the caller
@@ -874,6 +1082,7 @@ async function actionPublish(event: any) {
     entry.filename = filename;
     if (notes !== null) entry.notes = notes;
     if (contentHash !== null) entry.contentHash = contentHash;
+    if (source !== null) entry.source = source;
     delete entry.error;
     delete entry.publishedAt;
     delete entry.bytes;

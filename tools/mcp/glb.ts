@@ -16,8 +16,15 @@
 import * as fs from 'fs';
 
 // The magic-byte check the processor applies to every upload, so "would this be
-// accepted?" is answered by the same predicate on both sides.
-import { looksLikeGlb } from '../../lib/lambda/handler';
+// accepted?" is answered by the same predicate on both sides — and the same
+// validator the API will run over the provenance, so a bad field is reported here
+// rather than as a 400 after an export has already been done.
+import {
+  looksLikeGlb,
+  normalizeSource,
+  SOURCE_SCHEMA,
+  type SourceProvenance,
+} from '../../lib/lambda/handler';
 
 import type { Config } from './config';
 
@@ -70,6 +77,14 @@ export interface GlbReport {
   warnings: string[];
   /** Would the deployed processor accept this file? */
   publishable: boolean;
+  /** Where the file says it was built from, or null; see readSourceFromGlb. */
+  source: SourceProvenance | null;
+  /**
+   * Why the file's own provenance could not be used, when it declared some. A
+   * publish refuses on this rather than spending a revision number on a model
+   * whose provenance was quietly dropped.
+   */
+  sourceError: string | null;
 }
 
 /**
@@ -121,6 +136,121 @@ export function parseGlbContainer(buf: Buffer): ParsedGlb {
 
   if (json === undefined) throw new GlbError('The .glb has no JSON chunk.');
   return { version, declaredLength, jsonLength, binLength, json };
+}
+
+// --- source provenance, carried inside the container --------------------------
+
+/**
+ * The fields the contract defines. Anything else in `extras.source` is reported
+ * rather than dropped in silence: a producer that typos `commmit` would otherwise
+ * publish a revision that looks fine and records nothing.
+ */
+const SOURCE_KEYS = [
+  'schema',
+  'repo',
+  'cloneUrl',
+  'commit',
+  'ref',
+  'dirty',
+  'tree',
+  'path',
+  'build',
+  'recreate',
+] as const;
+
+export interface SourceFromGlb {
+  source: SourceProvenance | null;
+  /** Present but unusable — the message says which field and why. */
+  error: string | null;
+  warnings: string[];
+}
+
+/**
+ * Lift the provenance out of a .glb's `asset.extras.source`.
+ *
+ * This is where the contract is *read*, and the reason it lives in the file rather
+ * than in a publish argument: extras are part of the bytes, so they cannot drift
+ * from the model they describe, they survive being downloaded, and a rebuild from a
+ * different commit is a different file — which is what keeps the API's
+ * identical-bytes dedupe from collapsing two genuinely different revisions into one.
+ *
+ * `schema` is the discriminator and is required here. `extras.source` is a plausible
+ * name for some other tool's data, and guessing at a foreign object would be worse
+ * than ignoring it, so a missing or unrecognized schema means "not ours".
+ */
+export function readSourceFromGlb(json: any): SourceFromGlb {
+  const raw = json?.asset?.extras?.source;
+  if (raw === undefined || raw === null) return { source: null, error: null, warnings: [] };
+
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      source: null,
+      error: 'asset.extras.source is not an object, so it is not this host\'s provenance record.',
+      warnings: [],
+    };
+  }
+
+  const schema = raw.schema === undefined || raw.schema === null ? '' : String(raw.schema).trim();
+  if (schema !== SOURCE_SCHEMA) {
+    return {
+      source: null,
+      error:
+        `asset.extras.source declares schema ${schema ? `"${schema}"` : '(none)'}, not ` +
+        `"${SOURCE_SCHEMA}" — ignoring it, because extras.source is a name another tool could ` +
+        'also use and guessing at a foreign record is worse than reading none.',
+      warnings: [],
+    };
+  }
+
+  const warnings: string[] = [];
+  const unknown = Object.keys(raw).filter((key) => !(SOURCE_KEYS as readonly string[]).includes(key));
+  if (unknown.length) {
+    warnings.push(
+      `asset.extras.source carries field(s) the contract does not define (${unknown.join(', ')}); ` +
+        'they are dropped. Check for a typo — README, "Recording where a model came from", ' +
+        'lists every field.',
+    );
+  }
+
+  try {
+    // The same validator POST /publish runs, so an inspection that reports a source
+    // is an inspection that guarantees the publish will not be rejected over it.
+    const source = normalizeSource(raw);
+    if (!source) {
+      return {
+        source: null,
+        error:
+          'asset.extras.source has a valid schema but no other field with a value in it, so it ' +
+          'records nothing.',
+        warnings,
+      };
+    }
+    return { source, error: null, warnings };
+  } catch (err) {
+    return {
+      source: null,
+      error: `asset.extras.source is not valid: ${err instanceof Error ? err.message : String(err)}`,
+      warnings,
+    };
+  }
+}
+
+/** A one-line rendering of a provenance record, for a tool summary. */
+export function summarizeSource(source: SourceProvenance): string[] {
+  const lines: string[] = [];
+  const where = [source.repo, source.path].filter(Boolean).join('/');
+  const commit = source.commit ? source.commit.slice(0, 12) : null;
+  lines.push(
+    `Source: ${where || '(unnamed repository)'}${commit ? ` at ${commit}` : ' at an unrecorded commit'}` +
+      `${source.ref ? ` (${source.ref})` : ''}${source.dirty ? ' — WITH UNCOMMITTED CHANGES' : ''}`,
+  );
+  if (source.dirty && source.tree) lines.push(`  built from tree ${source.tree.slice(0, 12)}`);
+  if (source.cloneUrl) lines.push(`  clone: ${source.cloneUrl}`);
+  if (source.build) lines.push(`  build: ${source.build}`);
+  if (source.recreate) {
+    for (const line of source.recreate.split('\n')) lines.push(`  ${line}`);
+  }
+  return lines;
 }
 
 // --- the viewer's parts-panel logic, applied to the glTF JSON ----------------
@@ -260,6 +390,12 @@ export function inspectGlb(file: string, cfg: Config): GlbReport {
   const parts = predictParts(json);
   const warnings: string[] = [];
 
+  // Read before anything else, so a broken provenance record is reported even for a
+  // file that also fails the size cap.
+  const provenance = readSourceFromGlb(json);
+  warnings.push(...provenance.warnings);
+  if (provenance.error) warnings.push(provenance.error);
+
   if (parsed.version !== 2) {
     warnings.push(`glTF version is ${parsed.version}; the viewer expects 2.`);
   }
@@ -323,6 +459,8 @@ export function inspectGlb(file: string, cfg: Config): GlbReport {
     parts,
     warnings,
     publishable: !overCap,
+    source: provenance.source,
+    sourceError: provenance.error,
   };
 }
 

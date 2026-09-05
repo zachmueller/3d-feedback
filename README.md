@@ -119,6 +119,11 @@ Endpoints are read from `--api-url`/`--site-url`, then `THREED_API_URL`/
 `THREED_SITE_URL`, then `cdk-outputs.json`. Deploy with
 `--outputs-file cdk-outputs.json` and the flags become unnecessary.
 
+A `.glb` that records where it was built from has that published with the revision
+automatically — see [Recording where a model came from](#recording-where-a-model-came-from).
+The `--source-*` flags (`--help` lists them) override what the file says, for an
+export that carries nothing.
+
 ### Retrying without spending a revision
 
 Numbers are never reused, so a retry is the one thing a publisher must not do
@@ -143,6 +148,135 @@ in the client, so every caller gets them:
 the exact bytes it uploads, and TLS and S3's own checksums cover the transfer, so
 nothing re-reads a 100 MB model to confirm it. It is kept in the private index
 only; the public manifest still carries just what the viewer renders.
+
+## Recording where a model came from
+
+A revision can record the source state it was built from, so a reviewer looking at
+revision 3 can answer "which commit produced this, and how do I rebuild it?". The
+share page shows it under **Built from**, `list_revisions` and `get_publish_status`
+report it, and `/admin` displays it.
+
+It is entirely optional. Every revision published before this existed carries none,
+a FreeCAD export carries none, and nothing fails without it.
+
+### The contract
+
+The producer writes this into the `.glb` itself, as `asset.extras.source`:
+
+```json
+{
+  "asset": {
+    "version": "2.0",
+    "extras": {
+      "source": {
+        "schema": "3d-feedback/source@1",
+        "repo": "3d-models",
+        "cloneUrl": "https://git-codecommit.us-east-1.amazonaws.com/v1/repos/3d-models",
+        "commit": "7dd5ecd0f3a1…",
+        "ref": "main",
+        "path": "models/cloth-basket-small",
+        "build": "make cloth-basket-small",
+        "recreate": "git clone <url> && cd 3d-models && git checkout 7dd5ecd && make cloth-basket-small"
+      }
+    }
+  }
+}
+```
+
+| Field | Type | Cap | | Meaning |
+|---|---|---|---|---|
+| `schema` | string | — | **required** | `"3d-feedback/source@1"`. In a `.glb` this is the discriminator, not decoration — see below. |
+| `repo` | string | 100 | recommended | Repository identity as a short name (`3d-models`), not a URL. |
+| `cloneUrl` | string | 400 | optional | Where to get it. Must be `https://`, `http://`, `ssh://`, `git://`, `codecommit::` or `user@host:path`. Omit when there is no URL a reader could use — a wrong one is worse than none. |
+| `commit` | string | — | recommended | The exact commit: 40 (sha1) or 64 (sha256) lowercase hex. |
+| `ref` | string | 200 | optional | Branch or tag built from. Not a substitute for `commit`; refs move. |
+| `dirty` | boolean | — | optional | `true` when the working tree had uncommitted changes. Omit it otherwise — `false` is recorded as absent. |
+| `tree` | string | — | **required when `dirty`** | git tree oid of what was actually built, as hex. |
+| `path` | string | 200 | recommended | The model's directory in the repo. Repo-relative POSIX: no leading `/`, no `..`, no backslash. |
+| `build` | string | 200 | recommended | The command that rebuilds it. Displayed, never executed. |
+| `recreate` | string | 600 | recommended | One human-readable line telling a reviewer how to recreate this. **Worth more than the rest put together** — it is what actually gets read. Newlines allowed. |
+
+Unknown keys are **dropped, not rejected**, so a producer can send a field this
+deployment predates; `inspect_glb` names them, so a `commmit` typo is visible rather
+than silent. A malformed value *is* rejected — a commit id that is not one, a path
+that escapes the repository, a clone URL nobody could clone from — because it would
+otherwise be rendered as though it were a fact. Every string is sanitized and capped
+through the same `optionalText` a comment goes through: this lands in the public
+manifest and on a public page, so it is treated as untrusted input.
+
+Uncommitted work is a **flag plus a hash, never a diff**. The manifest is public and
+a patch has no upper bound. Compute `tree` against a scratch index so the real one is
+untouched:
+
+```sh
+export GIT_INDEX_FILE=$(mktemp -u); git read-tree HEAD; git add -A
+TREE=$(git write-tree); unset GIT_INDEX_FILE
+```
+
+When the tree is clean, `tree` equals `git rev-parse HEAD^{tree}` and can be omitted.
+`git add -A` respects `.gitignore`, so generated output stays out of it.
+
+### The extras must be deterministic
+
+**No build timestamp, no absolute path, no hostname, no username, no random id.**
+Every value must be a function of the git state alone.
+
+This is not tidiness. Rebuilding the same commit has to produce a byte-identical
+`.glb`, because identical bytes are how a retry is recognised — the entire mechanism
+in "Retrying without spending a revision" above. A timestamp in the extras makes
+every rebuild a new file, so every retry burns a revision number that can never be
+reused.
+
+### Why it rides inside the file rather than as a publish argument
+
+`POST /publish` does accept a `source` argument, and the MCP tools and CLI expose it,
+but the file's own extras are the default and the argument is the override. The
+reason is the dedupe:
+
+- `findDuplicateRevision()` compares `contentHash` and nothing else, and the dedupe
+  path deliberately applies neither title nor notes to a revision that already
+  exists. As a **separate argument**, provenance inherits that: the same geometry
+  rebuilt from a different commit dedupes to the old revision and the new commit is
+  silently dropped.
+- **Inside the file** the problem cannot arise. Different provenance is different
+  bytes is a different hash, so a rebuild from a different commit is a genuinely new
+  revision. The record also cannot drift from the model it describes, and it survives
+  being downloaded.
+- `inspect_glb` can then show it before anything is reserved.
+
+The override keeps its inherited wrinkle, so the publish client says so at the moment
+it is used: republishing identical bytes with a different `source` dedupes and drops
+it. `--force` is the way out.
+
+`schema` is required *in the file* for a related reason: `extras.source` is a
+plausible name for another tool's data, and guessing at a foreign record would be
+worse than reading none. On the wire it is optional — nobody typing
+`--source-commit` is going to type a schema — and the server stamps the current
+version.
+
+### It cannot be edited after the fact
+
+`/admin` shows provenance and does not let you change it, unlike notes and the title.
+Provenance is a mechanical claim about bytes that are immutable, and its whole value
+is that it cannot drift from them. A hand-typed commit id is an assertion nobody can
+check against the model — worse than no provenance, because it looks authoritative.
+Notes and titles stay editable because they are prose, meant to be revised. The
+remedy for wrong provenance is a new revision, the same reasoning that makes a
+published model immutable.
+
+### What this is not
+
+There is no source *download*. `3d-models` lives in CodeCommit in the same AWS
+account as this deployment, and it cannot serve the reviewer: CodeCommit has no
+anonymous read path at all — no public URL, no presigned object, no CloudFront
+origin, every read SigV4 — and reviewers have no AWS account. Serving it would mean a
+public unauthenticated route walking `GetFolder`/`GetBlob` in front of a private repo,
+which would also die whenever the account moves off CodeCommit (it is closed to new
+customers and in maintenance mode). A force-push or branch delete can orphan a
+recorded commit too, so even the repo is not the durable store an immutable S3 object
+is. So the provenance says precisely what produced the bytes and how to rebuild it,
+and obtaining the repository is out of band for whoever has access. The model itself
+*is* downloadable from the share page — that URL was always public.
 
 ## Exporting from FreeCAD
 
@@ -231,11 +365,11 @@ public objects the viewer reads, straight off the distribution.
 | `check_setup` | Effective config (and which layer each value came from) plus a read-only health check: FreeCAD binary, resolved endpoints, whether the site answers, and whether the profile has live credentials **for the deployment's own account** — it compares `GetCallerIdentity` against the account in the `PublishRouteArn` output, because an ambient `AWS_PROFILE` pointing elsewhere otherwise shows up only as an opaque 403. Names the fix for each failure. |
 | `export_glb` | Headless `freecadcmd` export of a **saved** `.FCStd`, then reports the parts panel it produced |
 | `gui_export_instructions` | The `exec()` snippet to run in an already-open FreeCAD (freecad-mcp), which keeps per-face colours and exports the live document |
-| `inspect_glb` | Local check: parts-panel prediction, `ref_` parts, triangle counts, would the processor accept it |
+| `inspect_glb` | Local check: parts-panel prediction, `ref_` parts, triangle counts, the source provenance the file declares, would the processor accept it |
 | `publish_model` | Publish an existing `.glb` as the next revision; returns the share URL. Identical bytes return the existing revision; `revision` finishes one that was already reserved |
 | `convert_and_publish` | Export → inspect → publish in one call |
-| `list_revisions` | What a reviewer can see: title, latest, every published revision with its notes, size, comment count and URL |
-| `get_publish_status` | Whether a publish landed — `ready` with the URL, `error` with the processor's reason, or still `processing`. The tool for a publish whose wait timed out |
+| `list_revisions` | What a reviewer can see: title, latest, every published revision with its notes, size, comment count, URL and the commit it was built from |
+| `get_publish_status` | Whether a publish landed — `ready` with the URL and the commit, `error` with the processor's reason, or still `processing`. The tool for a publish whose wait timed out |
 | `get_feedback` | The comments on one revision, or across the project, newest first |
 | `verify_revision` | Fetch the share page and the model as a reviewer would: status, content type, immutable caching, and that the size served matches the manifest |
 
@@ -420,7 +554,12 @@ in a second pass.
   ceiling long before that — it kills the tab rather than degrading when GPU
   memory runs out, so keep exports lean (the viewer caps its pixel ratio at 2 to
   help). Draco compression is the obvious next step if models get heavy.
-- One `.glb` per revision; no STEP/STL attachments yet.
+- One `.glb` per revision; no STEP/STL attachments, and no source archive. A revision
+  can *name* the commit it was built from and how to rebuild it
+  ([above](#recording-where-a-model-came-from)), but obtaining the repository is out
+  of band — reviewers have no AWS account and CodeCommit has no anonymous read path.
+- Provenance cannot be corrected after the fact, by anyone, deliberately; the fix is
+  a new revision.
 - `/comment` is public. Payload caps, a 200-comment ceiling per revision, route
   throttling and a check that the revision exists bound the damage; spam is
   cleaned up by deleting the revision or the project.

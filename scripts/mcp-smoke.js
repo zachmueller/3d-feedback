@@ -170,6 +170,19 @@ const textOf = (response) =>
     'inspect_glb leaves printed parts switched on',
     /\[x\] Base Plate/.test(inspectText) && /\[x\] Clip Arm/.test(inspectText),
   );
+  // The sample declares its provenance in asset.extras.source, the way a producer
+  // does, so this is the contract's read path exercised over real stdio. A warning
+  // here would mean the record parsed as somebody else's or failed validation.
+  check(
+    'inspect_glb reports the source the sample was built from',
+    /Source: 3d-models\/models\/sample-clip at /.test(inspectText),
+    inspectText.slice(0, 600),
+  );
+  check(
+    'inspect_glb finds nothing to complain about in that source',
+    !/extras\.source/.test(inspectText),
+    inspectText.slice(0, 600),
+  );
   if (verbose) console.log(`\n${inspectText}\n`);
 
   const bad = await request('tools/call', {

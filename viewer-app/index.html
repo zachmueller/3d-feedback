@@ -73,6 +73,16 @@
       <h2>This revision</h2>
       <p id="revNotes" class="notes"></p>
       <p id="revMeta" class="meta"></p>
+      <p id="revDownloads" class="meta"></p>
+    </section>
+
+    <!-- Only shown for a revision that recorded where it was built from; every
+         value here comes from the public manifest, so viewer.js assigns it with
+         textContent and never renders the clone URL as a link. -->
+    <section id="sourceInfo" class="card hidden">
+      <h2>Built from</h2>
+      <p id="revRecreate" class="notes mono"></p>
+      <dl id="revSource" class="meta"></dl>
     </section>
 
     <section id="feedback" class="card">
