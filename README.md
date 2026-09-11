@@ -14,7 +14,9 @@ from the CLI, send the link, read the comments, iterate again.
 
 Reviewers need no account — they orbit/zoom/pan the model in the browser, toggle
 individual parts of an assembly, step through earlier revisions, and leave
-feedback. Publishing and administration are yours alone.
+feedback. Publishing and administration are yours alone; a second, read-only
+allowlist can sign in to **`/browse`** and see everything published without being
+able to change any of it.
 
 ## Architecture
 
@@ -26,7 +28,7 @@ feedback. Publishing and administration are yours alone.
                             │  *.glb                → model        (1yr)       │
                             │  /projects|comments|status/*         (5s)        │
                             │  /viewer/* /app/*                   (60s)       │
-                            │  /login /admin        → app/*.html   (60s)       │
+                            │  /login /admin /browse → app/*.html  (60s)       │
                             └───────────────┬──────────────────────────────────┘
                                             │ OAC (private)
                                      ┌──────▼────────┐
@@ -41,6 +43,7 @@ feedback. Publishing and administration are yours alone.
   you (Google) ─────▶ /list /edit  ┌──────┴────────┐
                       /delete      │ staging bucket│◀── presigned PUT
                       /feedback    └───────────────┘    (30-day lifecycle)
+  reader (Google) ──▶ /browse
 ```
 
 **Three S3 buckets**, all private:
@@ -62,8 +65,42 @@ concurrency or a database.
 | Route | Auth | Why |
 |---|---|---|
 | `POST /publish` | `AWS_IAM` (SigV4) | A script with AWS credentials can publish; no OAuth dance |
-| `POST /list`, `/edit`, `/delete`, `/feedback` | Cognito JWT + email allowlist | Human admin, Google sign-in, allowlist re-checked per request |
+| `POST /list`, `/edit`, `/delete`, `/feedback` | Cognito JWT + **admin** allowlist | Human admin, Google sign-in, allowlist re-checked per request |
+| `POST /browse` | Cognito JWT + **either** allowlist | Read-only catalog; see [Two kinds of account](#two-kinds-of-account) |
 | `POST /comment` | none, throttled 5 rps | Reviewers comment without an account |
+
+### Two kinds of account
+
+`threedHost:allowedEmails` are admins. `threedHost:viewerEmails` are readers: they
+sign in with Google exactly the same way and get `/browse`, a paged list of every
+published project and revision with its notes, size, date, comment count and "built
+from" provenance — the same cards `/admin` shows, minus every button that changes
+something. No rename, no notes, no delete, no feedback roll-up, and no `/admin`.
+
+There is **one user pool and one JWT authorizer**, so a reader's token reaches every
+Cognito route and API Gateway cannot tell the two roles apart. The handler's
+per-request email check is therefore the only thing standing between a reader and
+`POST /delete`, which is why it is a positive test for the `admin` role rather than
+a check that the caller is not a stranger, and why `test/handler.test.ts` asserts
+each admin action refuses a reader individually. The alternative — a second user
+pool, or Cognito groups — would put the role in the token but move the source of
+truth out of this repository and into console state that can drift from the
+allowlist gating sign-up.
+
+The two gates that already existed keep their division of labour: the pre-signup
+trigger accepts either list and answers "may this person have an account at all?",
+and the handler answers "what may this account do?". An address on both lists is
+an admin; adding or removing a reader is a deploy.
+
+Both roles land on `/browse` after signing in at `/login`, and admins get a link on
+from there — a reader has no business on `/admin`, and landing everyone on the page
+both roles can use avoids a role lookup purely to decide where to go. Deep links
+are unaffected: signing in from `/admin` returns to `/admin`.
+
+`/browse` returns the same projection of a revision the public manifest does
+(`publicRevision`), so `contentHash`, `filename`, `error` and `status` cannot reach
+it, and a project whose only publish failed is absent rather than listed as a dead
+card.
 
 ### The two admin listings are paged
 
@@ -414,8 +451,8 @@ public objects the viewer reads, straight off the distribution.
 | `verify_revision` | Fetch the share page and the model as a reviewer would: status, content type, immutable caching, and that the size served matches the manifest |
 
 Editing, deleting and listing *every* project are deliberately absent: those routes
-are Cognito-only (`/admin`), and a headless server cannot complete a Google
-sign-in. Publishing works because `POST /publish` is SigV4, and the read tools work
+are Cognito-only (`/admin` and `/browse`), and a headless server cannot complete a
+Google sign-in. Publishing works because `POST /publish` is SigV4, and the read tools work
 because what they read is public — see the auth table above.
 
 A `ready` status and a working URL are different claims, which is why
@@ -522,6 +559,7 @@ Set in `cdk.json`, or override in a gitignored `config.local.json`:
 | Key | Meaning |
 |---|---|
 | `threedHost:allowedEmails` | Comma-separated admin allowlist |
+| `threedHost:viewerEmails` | Comma-separated read-only allowlist (blank ⇒ no readers) |
 | `threedHost:hostedUiPrefix` | Cognito Hosted-UI domain prefix (globally unique) |
 | `threedHost:domainName` | Custom domain (`3d.zach.nz`) |
 | `threedHost:domainEnabled` | `true` once the DNS records below exist in the parent zone |
@@ -579,7 +617,8 @@ in a second pass.
 | `lib/lambda/pre-signup.ts` | Cognito allowlist trigger |
 | `lib/cloudfront-functions/` | Viewer-request URL rewriting |
 | `viewer-app/` | Public viewer SPA (three.js, no build step) |
-| `admin-app/` | Admin SPA (Google PKCE, no build step) |
+| `admin-app/` | Signed-in SPAs — `admin.html`, the read-only `browse.html`, `login.html` (Google PKCE, no build step) |
+| `admin-app/cards.js` | Project/revision cards both pages render; `controls` adds the mutating buttons |
 | `tools/publish.sh` | Publish a revision, print the share URL (a wrapper over `tools/mcp/cli.ts`) |
 | `tools/parent-dns.sh` | The subdomain's records in the parent `zach.nz` zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
@@ -603,8 +642,13 @@ in a second pass.
 - `/comment` is public. Payload caps, a 200-comment ceiling per revision, route
   throttling and a check that the revision exists bound the damage; spam is
   cleaned up by deleting the revision or the project.
-- The admin app cannot be exercised locally — Cognito sign-in needs the deployed
-  Hosted UI.
+- Neither `/admin` nor `/browse` can be exercised locally past the sign-in —
+  Cognito needs the deployed Hosted UI. `npm run dev` serves both pages and routes
+  them through the real edge function, so a routing or rendering change is visible;
+  the data behind them is not.
+- Adding or removing a read-only account is a deploy: the allowlists are CDK
+  context, which is what keeps one source of truth for who may sign in and what
+  they may do.
 - The MCP server publishes and reads, but cannot list *every* project, edit notes
   or delete anything: those routes need a Cognito JWT from a Google sign-in, which
   a headless server has no way to complete. Reading works only because the

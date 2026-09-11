@@ -6,7 +6,8 @@
  *  - HTTP API -> router, with three auth models enforced upstream by API
  *    Gateway and mirrored here:
  *      publish                        AWS_IAM (SigV4) — automation
- *      list / edit / delete / feedback Cognito JWT + email allowlist re-check
+ *      list / edit / delete / feedback Cognito JWT + admin allowlist re-check
+ *      browse                         Cognito JWT + either allowlist (read-only)
  *      comment                        public (throttled route + caps below)
  *  - S3 `OBJECT_CREATED` (staging bucket, prefix `uploads/`) -> processor:
  *    validate the GLB, copy it to its immutable revision path, flip the
@@ -59,6 +60,7 @@ export const RESERVED_SLUGS = [
   'admin',
   'api',
   'app',
+  'browse',
   'comments',
   'favicon.ico',
   'feedback',
@@ -573,26 +575,41 @@ export function revisionForResume(project: ProjectEntry, rev: number): ResumeChe
   return { ok: true, entry };
 }
 
+/** One revision as everyone without admin rights sees it — see publicRevision. */
+export type PublicRevision = Manifest['revisions'][number];
+
 /**
- * Project the private index down to what the viewer is allowed to see.
+ * The single projection of a revision down to what a non-admin may see.
+ *
+ * It is *what is missing* that matters: `status`, `error`, `filename` and
+ * `contentHash` all stay in the private index. Two callers rely on this — the
+ * public manifest the viewer fetches, and the read-only `/browse` listing — and
+ * they share this function rather than each writing the field list out, because
+ * two projections of the same record drift and the drift is a disclosure.
  *
  * `source` is spread in only when the revision has one, rather than emitted as
- * `null`. Every published revision predates provenance, and this manifest is
- * fetched on every share-page load — so an absent source produces byte-identical
- * output to before, and "backward compatible" is literal rather than nominal.
+ * `null`. Every revision published before provenance existed carries none, and the
+ * manifest is fetched on every share-page load — so an absent source produces
+ * byte-identical output to before, and "backward compatible" is literal rather
+ * than nominal.
  */
+export function publicRevision(r: RevisionEntry): PublicRevision {
+  return {
+    rev: r.rev,
+    publishedAt: r.publishedAt ?? null,
+    notes: r.notes ?? null,
+    bytes: r.bytes ?? null,
+    commentCount: r.commentCount ?? 0,
+    ...(r.source ? { source: r.source } : {}),
+  };
+}
+
+/** Project the private index down to what the viewer is allowed to see. */
 export function buildManifest(project: ProjectEntry): Manifest {
   const revisions = Object.values(project.revisions)
     .filter((r) => r.status === 'ready')
     .sort((a, b) => a.rev - b.rev)
-    .map((r) => ({
-      rev: r.rev,
-      publishedAt: r.publishedAt ?? null,
-      notes: r.notes ?? null,
-      bytes: r.bytes ?? null,
-      commentCount: r.commentCount ?? 0,
-      ...(r.source ? { source: r.source } : {}),
-    }));
+    .map(publicRevision);
   return {
     slug: project.slug,
     title: project.title,
@@ -614,6 +631,20 @@ export interface ProjectPageEntry {
   /** Newest first, at most the requested `revisionLimit`. */
   revisions: RevisionEntry[];
   /** How many the project actually has, so the UI can offer the rest. */
+  revisionCount: number;
+}
+
+/**
+ * One project as `/browse` renders it: the admin page's card, with the private
+ * fields projected away and nothing but published revisions in it.
+ */
+export interface CatalogPageEntry {
+  slug: string;
+  title: string | null;
+  latest: number | null;
+  /** Newest first, at most the requested `revisionLimit`, all of them `ready`. */
+  revisions: PublicRevision[];
+  /** How many *published* revisions the project has, so the UI can offer the rest. */
   revisionCount: number;
 }
 
@@ -690,6 +721,58 @@ export function pageOfProjects(
       createdAt: project.createdAt,
       latest: computeLatest(project),
       revisions: revisions.slice(0, opts.revisionLimit),
+      revisionCount: revisions.length,
+    }));
+
+  return { projects, total: ordered.length };
+}
+
+/**
+ * One page of the read-only catalog: every project that has something published,
+ * newest activity first.
+ *
+ * Deliberately *not* `pageOfProjects` with a filter bolted on afterwards. Three
+ * things differ, and each of them would be wrong that way round:
+ *
+ *  - **A project with nothing published is not in the catalog at all.** One whose
+ *    only publish failed has no page a reader could open, so listing it would
+ *    offer a dead card — and leak that a publish was attempted and failed.
+ *  - **`total` and the window are computed over the filtered set**, so paging is
+ *    consistent: filtering *after* slicing would return short pages and a total
+ *    that never matches what arrives.
+ *  - **`revisionCount` counts published revisions only**, so "Show all 7" shows
+ *    seven.
+ *
+ * Every revision goes through `publicRevision`, so nothing private can reach a
+ * reader even if this function is later asked for a different window.
+ */
+export function pageOfCatalog(
+  meta: Metadata,
+  opts: { limit: number; offset: number; revisionLimit: number },
+): { projects: CatalogPageEntry[]; total: number } {
+  const ordered = Object.values(meta.projects ?? {})
+    .map((project) => ({
+      project,
+      // Newest first, and `ready` only — which is also what makes revisions[0]
+      // below the newest *published* revision rather than a failed reservation.
+      revisions: Object.values(project.revisions)
+        .filter((r) => r.status === 'ready')
+        .sort((a, b) => b.rev - a.rev),
+    }))
+    .filter(({ revisions }) => revisions.length > 0)
+    .sort((a, b) => {
+      const aAt = a.revisions[0].publishedAt ?? a.project.createdAt;
+      const bAt = b.revisions[0].publishedAt ?? b.project.createdAt;
+      return bAt.localeCompare(aAt) || a.project.slug.localeCompare(b.project.slug);
+    });
+
+  const projects = ordered
+    .slice(opts.offset, opts.offset + opts.limit)
+    .map(({ project, revisions }) => ({
+      slug: project.slug,
+      title: project.title,
+      latest: computeLatest(project),
+      revisions: revisions.slice(0, opts.revisionLimit).map(publicRevision),
       revisionCount: revisions.length,
     }));
 
@@ -795,11 +878,38 @@ function env(name: string): string {
   return v;
 }
 
-function allowlist(): string[] {
-  return (process.env.ALLOWED_EMAILS ?? '')
+function emailList(value: string | undefined): string[] {
+  return (value ?? '')
     .split(',')
     .map((e) => e.trim().toLowerCase())
     .filter(Boolean);
+}
+
+/** Who may edit, delete and read the feedback roll-up. */
+function allowlist(): string[] {
+  return emailList(process.env.ALLOWED_EMAILS);
+}
+
+/** Who may read the published catalog and nothing else. */
+function viewerAllowlist(): string[] {
+  return emailList(process.env.VIEWER_EMAILS);
+}
+
+/** What a signed-in caller is allowed to be, or null for nobody we know. */
+export type Role = 'admin' | 'viewer';
+
+/**
+ * The caller's role, from the two allowlists.
+ *
+ * Admin wins when an address is on both: the lists are hand-maintained context, so
+ * an overlap is a typo, and resolving it towards *less* access would silently
+ * demote the person maintaining them.
+ */
+function roleFor(email: string): Role | null {
+  if (!email) return null;
+  if (allowlist().includes(email)) return 'admin';
+  if (viewerAllowlist().includes(email)) return 'viewer';
+  return null;
 }
 
 function siteUrl(): string {
@@ -1367,6 +1477,61 @@ async function actionList(event: any) {
   });
 }
 
+/**
+ * One page of the read-only catalog, for `/browse`.
+ *
+ * The same two shapes `actionList` takes, so the page can offer "Show all
+ * revisions" on a card the same way `/admin` does:
+ *
+ *   {}                              the next `limit` projects from `offset`
+ *   { project, revisionLimit }       that one project, with every revision
+ *
+ * `role` rides along in the response so the page knows whether to offer a link to
+ * `/admin`, which saves a second round trip purely to ask who the caller is. It is
+ * a rendering hint and nothing more — every admin action re-derives the role
+ * server-side, so a reader tampering with the response gains a link, not access.
+ */
+async function actionBrowse(event: any) {
+  const body = parseBody(event);
+  const one = body.project ?? body.slug;
+  const slug = one === undefined || one === null ? null : normalizeSlug(one);
+  const page = parsePage(body, { limit: DEFAULT_LIST_LIMIT, max: MAX_LIST_LIMIT });
+  const revisionLimit =
+    body.revisionLimit === undefined || body.revisionLimit === null
+      ? slug === null
+        ? DEFAULT_REVISION_LIMIT
+        : MAX_REVISION_LIMIT
+      : Math.min(
+          Math.max(nonNegativeInt(body.revisionLimit, 'revisionLimit'), 1),
+          MAX_REVISION_LIMIT,
+        );
+
+  const role = roleFor(callerEmail(event));
+  const meta = await readMetadata();
+
+  if (slug !== null) {
+    const project = meta.projects[slug];
+    // A project with nothing published answers 404 here exactly as a missing one
+    // does: to a reader they are the same thing, and distinguishing them would
+    // report that a publish was attempted.
+    const { projects } = project
+      ? pageOfCatalog({ projects: { [slug]: project } }, { limit: 1, offset: 0, revisionLimit })
+      : { projects: [] };
+    if (!projects.length) return json(404, { error: 'No such project' });
+    return json(200, { projects, total: 1, offset: 0, limit: 1, siteUrl: siteUrl(), role });
+  }
+
+  const { projects, total } = pageOfCatalog(meta, { ...page, revisionLimit });
+  return json(200, {
+    projects,
+    total,
+    offset: page.offset,
+    limit: page.limit,
+    siteUrl: siteUrl(),
+    role,
+  });
+}
+
 async function actionEdit(event: any) {
   const body = parseBody(event);
   const slug = normalizeSlug(body.project ?? body.slug);
@@ -1509,14 +1674,25 @@ async function actionFeedback(event: any) {
 }
 
 const ADMIN_ACTIONS = new Set(['list', 'edit', 'delete', 'feedback']);
+/** Read-only actions: the published catalog, open to either role. */
+const READ_ACTIONS = new Set(['browse']);
 
 async function handleHttp(event: any) {
   const action = actionFromPath(event);
 
-  // Admin actions re-check the Cognito email against the allowlist behind the
-  // JWT authorizer. `publish` is authorized by SigV4 and `comment` is public,
-  // so neither carries an email to check.
-  if (ADMIN_ACTIONS.has(action) && !allowlist().includes(callerEmail(event))) {
+  // Both sets of Cognito-authorized actions re-check the caller's email here,
+  // behind the JWT authorizer. `publish` is authorized by SigV4 and `comment` is
+  // public, so neither carries an email to check.
+  //
+  // One user pool issues tokens for both roles, and API Gateway's authorizer
+  // cannot tell them apart — a read-only user's token is a valid pool token that
+  // reaches every JWT route. So this check is the *only* thing between a reader
+  // and `/delete`, which is why each test is a positive assertion about the role
+  // rather than a check that the caller is not a stranger.
+  if (ADMIN_ACTIONS.has(action) && roleFor(callerEmail(event)) !== 'admin') {
+    return json(403, { error: 'Not authorized' });
+  }
+  if (READ_ACTIONS.has(action) && roleFor(callerEmail(event)) === null) {
     return json(403, { error: 'Not authorized' });
   }
 
@@ -1528,6 +1704,8 @@ async function handleHttp(event: any) {
         return await actionComment(event);
       case 'list':
         return await actionList(event);
+      case 'browse':
+        return await actionBrowse(event);
       case 'edit':
         return await actionEdit(event);
       case 'delete':

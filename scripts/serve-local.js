@@ -194,8 +194,8 @@ const server = http.createServer(async (req, res) => {
   if (/^\/[^/]+\/[0-9]+\/model\.glb$/.test(uri)) return sendFile(res, samplePath);
 
   // Everything else goes through the real edge functions.
-  const isAdminPath = uri === '/login' || uri === '/admin' || uri === '/login/' || uri === '/admin/';
-  const fn = isAdminPath ? adminRewrite : cleanUrl;
+  const isAppPath = ['/login', '/admin', '/browse'].includes(uri.replace(/\/$/, ''));
+  const fn = isAppPath ? adminRewrite : cleanUrl;
   const request = { uri, querystring: {} };
   const result = fn({ request });
 
@@ -216,4 +216,5 @@ server.listen(PORT, () => {
   console.log(`3d-feedback dev server on http://localhost:${PORT}`);
   console.log(`  viewer: http://localhost:${PORT}/sample/1  (and /sample, /sample/2)`);
   console.log(`  admin:  http://localhost:${PORT}/admin     (sign-in will not work locally)`);
+  console.log(`  browse: http://localhost:${PORT}/browse    (likewise)`);
 });

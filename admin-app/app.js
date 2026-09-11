@@ -16,6 +16,15 @@
 
 // --- config -----------------------------------------------------------------
 
+/**
+ * Where a signed-in session lands when it has nowhere more specific to go.
+ *
+ * /browse rather than /admin, because it is the page both roles can use: a
+ * read-only account has no business on /admin, and an admin gets a link to it from
+ * here. Deep links are unaffected — they return to the page that sent them.
+ */
+export const HOME = '/browse';
+
 let _config = null;
 export async function getConfig() {
   if (_config) return _config;
@@ -146,12 +155,14 @@ export async function beginLogin({ returnTo } = {}) {
   const challenge = base64UrlEncode(await sha256(verifier));
   const state = randomString(24);
   // Come back to the page that sent us — but never to /login itself, which would
-  // only bounce again once it saw the new token.
+  // only bounce again once it saw the new token. Signing in *at* /login lands on
+  // /browse, the one page both roles can use: an admin arriving from /admin still
+  // returns to /admin, because that is `here`.
   const here = `${window.location.pathname}${window.location.hash}`;
   savePending({
     verifier,
     state,
-    returnTo: returnTo ?? (window.location.pathname === '/login' ? '/admin' : here),
+    returnTo: returnTo ?? (window.location.pathname === '/login' ? HOME : here),
   });
 
   const params = new URLSearchParams({
@@ -272,7 +283,7 @@ export async function handleAuthCallback() {
   clearReauthAttempt();
   // Scrub the code/state from the URL bar.
   window.history.replaceState({}, document.title, '/login');
-  return { returnTo: pending.returnTo || '/admin' };
+  return { returnTo: pending.returnTo || HOME };
 }
 
 /**
@@ -409,7 +420,14 @@ export async function api(action, payload, { retries = 4 } = {}) {
     }
     const text = await res.text();
     const data = text ? JSON.parse(text) : {};
-    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    if (!res.ok) {
+      // The status rides on the error so a caller can act on the *kind* of failure
+      // — a 403 from an admin action means "wrong role", which /admin answers by
+      // sending the caller to /browse — without matching on message text.
+      const err = new Error(data.error || `Request failed (${res.status})`);
+      err.status = res.status;
+      throw err;
+    }
     return data;
   }
 }

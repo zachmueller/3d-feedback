@@ -28,6 +28,7 @@ import {
   buildManifest,
   parsePage,
   pageOfProjects,
+  pageOfCatalog,
   feedbackTargets,
   DEFAULT_LIST_LIMIT,
   MAX_LIST_LIMIT,
@@ -127,7 +128,9 @@ describe('normalizeSlug', () => {
   });
 
   it('covers the top-level prefixes the stack actually serves', () => {
-    for (const prefix of ['app', 'viewer', 'projects', 'comments', 'status', 'login', 'admin']) {
+    for (const prefix of [
+      'app', 'viewer', 'projects', 'comments', 'status', 'login', 'admin', 'browse',
+    ]) {
       expect(RESERVED_SLUGS).toContain(prefix);
     }
   });
@@ -729,15 +732,22 @@ describe('request authorization', () => {
     body: '{}',
   });
 
-  const original = process.env.ALLOWED_EMAILS;
+  const ADMIN_ONLY = ['list', 'edit', 'delete', 'feedback'];
+
+  const original = {
+    admin: process.env.ALLOWED_EMAILS,
+    viewer: process.env.VIEWER_EMAILS,
+  };
   beforeAll(() => {
     process.env.ALLOWED_EMAILS = 'me@example.com';
+    process.env.VIEWER_EMAILS = 'reader@example.com,other@example.com';
   });
   afterAll(() => {
-    process.env.ALLOWED_EMAILS = original;
+    process.env.ALLOWED_EMAILS = original.admin;
+    process.env.VIEWER_EMAILS = original.viewer;
   });
 
-  it.each(['list', 'edit', 'delete', 'feedback'])(
+  it.each(ADMIN_ONLY)(
     'rejects %s from an email that is not on the allowlist',
     async (action) => {
       const res = await handler(event(`/${action}`, 'stranger@example.com'));
@@ -759,6 +769,68 @@ describe('request authorization', () => {
     for (const action of ['publish', 'comment']) {
       const res = await handler(event(`/${action}`));
       expect(res.statusCode).not.toBe(403);
+    }
+  });
+
+  // The whole point of the read-only role. A reader holds a valid token for the
+  // same user pool, so API Gateway lets it reach every JWT route and this check is
+  // the only thing that turns it away — which is why every admin action is asserted
+  // individually rather than one standing in for the rest.
+  describe('a read-only account', () => {
+    it.each(ADMIN_ONLY)('is refused %s', async (action) => {
+      const res = await handler(event(`/${action}`, 'reader@example.com'));
+      expect(res.statusCode).toBe(403);
+      expect(JSON.parse(res.body).error).toBe('Not authorized');
+    });
+
+    it('may read the catalog', async () => {
+      const res = await handler(event('/browse', 'reader@example.com'));
+      expect(res.statusCode).not.toBe(403);
+    });
+
+    it('is matched case-insensitively, like the admin list', async () => {
+      const res = await handler(event('/browse', 'Reader@Example.com'));
+      expect(res.statusCode).not.toBe(403);
+    });
+  });
+
+  describe('the catalog route', () => {
+    it('lets an admin read it too', async () => {
+      const res = await handler(event('/browse', 'me@example.com'));
+      expect(res.statusCode).not.toBe(403);
+    });
+
+    it('refuses an email on neither list', async () => {
+      expect((await handler(event('/browse', 'stranger@example.com'))).statusCode).toBe(403);
+    });
+
+    it('refuses a request with no identity at all', async () => {
+      expect((await handler(event('/browse'))).statusCode).toBe(403);
+    });
+  });
+
+  // An address on both lists is a typo in hand-maintained context. Resolving it
+  // towards less access would silently demote whoever maintains the lists.
+  it('treats an address on both lists as an admin', async () => {
+    process.env.VIEWER_EMAILS = 'reader@example.com,me@example.com';
+    try {
+      const res = await handler(event('/delete', 'me@example.com'));
+      expect(res.statusCode).not.toBe(403);
+    } finally {
+      process.env.VIEWER_EMAILS = 'reader@example.com,other@example.com';
+    }
+  });
+
+  // With no readers configured — the default, and every deployment that predates
+  // this — the catalog is admin-only and no empty string matches anybody.
+  it('admits nobody to the catalog when no readers are configured', async () => {
+    process.env.VIEWER_EMAILS = '';
+    try {
+      expect((await handler(event('/browse', 'reader@example.com'))).statusCode).toBe(403);
+      expect((await handler(event('/browse', ''))).statusCode).toBe(403);
+      expect((await handler(event('/browse', 'me@example.com'))).statusCode).not.toBe(403);
+    } finally {
+      process.env.VIEWER_EMAILS = 'reader@example.com,other@example.com';
     }
   });
 
@@ -930,6 +1002,111 @@ describe('pageOfProjects', () => {
     const { projects } = page(meta);
     expect(projects[0].latest).toBeNull();
     expect(projects[0].revisionCount).toBe(1);
+  });
+
+  it('handles an index with no projects at all', () => {
+    expect(page(emptyMetadata())).toEqual({ projects: [], total: 0 });
+  });
+});
+
+describe('pageOfCatalog', () => {
+  const page = (meta: Metadata, opts: Partial<Parameters<typeof pageOfCatalog>[1]> = {}) =>
+    pageOfCatalog(meta, { limit: 20, offset: 0, revisionLimit: 10, ...opts });
+
+  // The security property of this function, and the reason it exists rather than
+  // being pageOfProjects with a filter after it. A read-only caller gets what a
+  // share page already shows and nothing that only the admin index knows.
+  it('carries no private field into a reader-facing page', () => {
+    const meta = projectWith(1);
+    const entry = meta.projects['towel-clip'].revisions['1'];
+    entry.notes = 'wider hook';
+    entry.bytes = 2048;
+    entry.commentCount = 2;
+    entry.contentHash = HASH_A;
+    entry.filename = 'private-name.glb';
+    entry.error = 'should not be published';
+
+    const [revision] = page(meta).projects[0].revisions;
+    expect(revision).toEqual({
+      rev: 1,
+      publishedAt: NOW,
+      notes: 'wider hook',
+      bytes: 2048,
+      commentCount: 2,
+    });
+    for (const field of ['contentHash', 'filename', 'error', 'status', 'reservedAt']) {
+      expect(revision).not.toHaveProperty(field);
+    }
+  });
+
+  it('carries the source provenance through, the same as the manifest does', () => {
+    const meta = projectWith(1);
+    meta.projects['towel-clip'].revisions['1'].source = normalizeSource(SOURCE);
+    const [revision] = page(meta).projects[0].revisions;
+    expect(revision.source).toEqual(buildManifest(meta.projects['towel-clip']).revisions[0].source);
+  });
+
+  it('hides a revision that is still processing or failed', () => {
+    const meta = projectWith(2);
+    reserveRevision(meta, 'towel-clip', { now: NOW }); // rev 3, processing
+    const rev4 = reserveRevision(meta, 'towel-clip', { now: NOW });
+    meta.projects['towel-clip'].revisions[String(rev4)].status = 'error';
+
+    const [project] = page(meta).projects;
+    expect(project.revisions.map((r) => r.rev)).toEqual([2, 1]);
+    // Not 4: "Show all N" has to promise a number the reader can actually see.
+    expect(project.revisionCount).toBe(2);
+  });
+
+  // A project whose only publish failed has no page to open. Listing it would offer
+  // a dead card and disclose that a publish was attempted at all.
+  it('omits a project that has nothing published, and does not count it', () => {
+    const meta = projectWith(1);
+    reserveRevision(meta, 'half-finished', { now: NOW });
+    const failed = reserveRevision(meta, 'all-broken', { now: NOW });
+    meta.projects['all-broken'].revisions[String(failed)].status = 'error';
+
+    const { projects, total } = page(meta);
+    expect(projects.map((p) => p.slug)).toEqual(['towel-clip']);
+    expect(total).toBe(1);
+  });
+
+  it('orders projects by most recent publish, newest first', () => {
+    const { projects } = page(projectsPublishedInOrder(3));
+    expect(projects.map((p) => p.slug)).toEqual(['project-0', 'project-1', 'project-2']);
+  });
+
+  // Filtering after slicing would return short pages and a total that never matches
+  // what arrives, so the window has to be taken over the published set.
+  it('pages over the published set without repeating or skipping a project', () => {
+    const meta = projectsPublishedInOrder(25);
+    // Two more projects that publish nothing; they must not consume a page slot.
+    reserveRevision(meta, 'pending-a', { now: NOW });
+    reserveRevision(meta, 'pending-b', { now: NOW });
+
+    const first = page(meta, { limit: 10, offset: 0 });
+    const seen = [
+      ...first.projects,
+      ...page(meta, { limit: 10, offset: 10 }).projects,
+      ...page(meta, { limit: 10, offset: 20 }).projects,
+    ].map((p) => p.slug);
+
+    expect(first.total).toBe(25);
+    expect(first.projects).toHaveLength(10);
+    expect(seen).toHaveLength(25);
+    expect(new Set(seen).size).toBe(25);
+  });
+
+  it('gives the newest revisions first, capped, but reports how many there are', () => {
+    const { projects } = page(projectsPublishedInOrder(1, 47), { revisionLimit: 3 });
+    expect(projects[0].revisions.map((r) => r.rev)).toEqual([47, 46, 45]);
+    expect(projects[0].revisionCount).toBe(47);
+  });
+
+  it('returns nothing for an offset past the end, without throwing', () => {
+    const { projects, total } = page(projectsPublishedInOrder(3), { offset: 99 });
+    expect(projects).toEqual([]);
+    expect(total).toBe(3);
   });
 
   it('handles an index with no projects at all', () => {

@@ -89,12 +89,26 @@ describe('admin-rewrite viewer-request function', () => {
     expect(rewrite('/admin').uri).toBe('/app/admin.html');
   });
 
+  // The read-only catalog. It is a separate page rather than a mode of /admin so
+  // that a read-only account never loads the admin shell at all.
+  it('maps /browse to the read-only catalog page', () => {
+    expect(rewrite('/browse').uri).toBe('/app/browse.html');
+  });
+
   it('tolerates a trailing slash', () => {
     expect(rewrite('/admin/').uri).toBe('/app/admin.html');
+    expect(rewrite('/browse/').uri).toBe('/app/browse.html');
   });
 
   it('maps /login and anything unexpected to the login page', () => {
     expect(rewrite('/login').uri).toBe('/app/login.html');
     expect(rewrite('/whatever').uri).toBe('/app/login.html');
+  });
+
+  // The page table is a plain object, so an inherited property name must not
+  // resolve to whatever Object.prototype has under it.
+  it('does not serve a page for a prototype property name', () => {
+    expect(rewrite('/constructor').uri).toBe('/app/login.html');
+    expect(rewrite('/hasOwnProperty').uri).toBe('/app/login.html');
   });
 });

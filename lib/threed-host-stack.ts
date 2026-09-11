@@ -57,6 +57,10 @@ export class ThreedHostStack extends Stack {
 
     // --- context / config ---------------------------------------------------
     const allowedEmails = this.ctx('threedHost:allowedEmails', 'you@example.com');
+    // Read-only accounts: they sign in with Google the same way, see the published
+    // catalog at /browse, and are refused by every admin route. Blank by default,
+    // so a deployment that wants no readers creates none.
+    const viewerEmails = this.ctx('threedHost:viewerEmails', '');
     const hostedUiPrefix = this.ctx('threedHost:hostedUiPrefix', 'threed-host-admin');
     const domainName = this.ctx('threedHost:domainName', '3d.zach.nz');
     // This subdomain is served straight from the parent `zach.nz` zone, which
@@ -214,9 +218,10 @@ export class ThreedHostStack extends Stack {
         // Static app assets (no rewrite).
         '/viewer/*': this.liveBehavior(assetsOrigin, shortCache),
         '/app/*': this.liveBehavior(assetsOrigin, shortCache),
-        // Admin app shell (served from app/*.html via the rewrite function).
+        // Signed-in app shells (served from app/*.html via the rewrite function).
         '/login': this.adminBehavior(assetsOrigin, shortCache, adminAssoc),
         '/admin': this.adminBehavior(assetsOrigin, shortCache, adminAssoc),
+        '/browse': this.adminBehavior(assetsOrigin, shortCache, adminAssoc),
       },
       // A missing key behind OAC surfaces as 403; both map to a friendly page.
       // The viewer relies on the non-2xx status (not the body) to detect an
@@ -255,7 +260,9 @@ export class ThreedHostStack extends Stack {
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_22_X,
       timeout: Duration.seconds(10),
-      environment: { ALLOWED_EMAILS: allowedEmails },
+      // Both lists: this trigger decides who may have an account at all, and the
+      // API handler decides what each account can do with it.
+      environment: { ALLOWED_EMAILS: allowedEmails, VIEWER_EMAILS: viewerEmails },
     });
 
     const userPool = new cognito.UserPool(this, 'UserPool', {
@@ -348,6 +355,7 @@ export class ThreedHostStack extends Stack {
         METADATA_BUCKET: metadataBucket.bucketName,
         METADATA_KEY,
         ALLOWED_EMAILS: allowedEmails,
+        VIEWER_EMAILS: viewerEmails,
         DISTRIBUTION_ID: distribution.distributionId,
         SITE_URL: siteUrl,
       },
@@ -417,7 +425,8 @@ export class ThreedHostStack extends Stack {
       authorizer: iamAuthorizer,
     });
 
-    // Admin actions — Google sign-in + email allowlist (re-checked in the handler).
+    // Admin actions — Google sign-in + the admin allowlist (re-checked in the
+    // handler, which is where a read-only account is turned away).
     const adminRoutes = ['list', 'edit', 'delete', 'feedback'].flatMap((action) =>
       httpApi.addRoutes({
         path: `/${action}`,
@@ -426,6 +435,17 @@ export class ThreedHostStack extends Stack {
         authorizer: jwtAuthorizer,
       }),
     );
+
+    // Read-only: the published catalog, for accounts on either allowlist. Same
+    // authorizer as the admin routes — one user pool issues both roles' tokens, so
+    // the handler is what tells them apart. Kept out of `adminRoutes` because the
+    // two have genuinely different authorization, not merely different paths.
+    const readRoutes = httpApi.addRoutes({
+      path: '/browse',
+      methods: [apigwv2.HttpMethod.POST],
+      integration,
+      authorizer: jwtAuthorizer,
+    });
 
     // Public: anyone with a share link can leave feedback without signing in.
     // Guarded by route throttling below plus strict caps in the handler.
@@ -449,7 +469,7 @@ export class ThreedHostStack extends Stack {
     // race ("Unable to find Route by key POST /comment"). Only the keyed route
     // needs to exist first, but depending on all of them is cheap and keeps this
     // correct if another route is given settings later.
-    for (const route of [...publishRoutes, ...adminRoutes, ...commentRoutes]) {
+    for (const route of [...publishRoutes, ...adminRoutes, ...readRoutes, ...commentRoutes]) {
       stage.node.addDependency(route);
     }
 
@@ -476,7 +496,7 @@ export class ThreedHostStack extends Stack {
         }),
       ],
       distribution,
-      distributionPaths: ['/login', '/admin', '/app/*'],
+      distributionPaths: ['/login', '/admin', '/browse', '/app/*'],
     });
 
     new s3deploy.BucketDeployment(this, 'DeployViewerApp', {

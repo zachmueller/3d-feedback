@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta name="color-scheme" content="light dark" />
+  <title>Published models · 3D models</title>
+  <link rel="stylesheet" href="/app/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">3D models</div>
+    <nav>
+      <!-- Revealed only when the API says this account is an admin. It is a link,
+           not a permission: /admin refuses a read-only token on every action. -->
+      <a href="/admin" id="manage" class="hidden">Manage</a>
+      <a href="#" id="logout">Sign out</a>
+    </nav>
+  </header>
+
+  <main>
+    <div class="row">
+      <div>
+        <h1>Published models</h1>
+        <p class="subtitle">
+          Every model published so far. Open a revision to orbit it, toggle its
+          parts and leave feedback.
+        </p>
+      </div>
+      <div class="spacer"></div>
+      <button id="refresh" class="btn secondary small">Refresh</button>
+    </div>
+
+    <div id="status" class="status"></div>
+
+    <div id="projects" class="stack"></div>
+    <div id="empty" class="empty hidden">Nothing has been published yet.</div>
+    <div id="loading" class="empty"><span class="spinner"></span> Loading…</div>
+    <div id="projectsMore" class="more hidden">
+      <span id="projectsCount" class="meta"></span>
+      <button class="btn secondary small" data-act="more-projects">Load more</button>
+    </div>
+  </main>
+
+  <script type="module">
+    /* The read-only catalog.
+     *
+     * Deliberately thin: it renders `POST /browse` with the shared cards and owns
+     * no mutating action at all. There is nothing to withhold here defensively —
+     * the API is what refuses an edit from a read-only account — so the page is
+     * simply the list, its paging, and the two things a reader does with it (copy a
+     * link, expand a note). */
+    import {
+      requireAuth, api, getConfig, logout, canonicalizeOrigin, startTokenRefresh,
+      el, setStatus, copyText, escapeHtml,
+    } from '/app/app.js';
+    import { projectCard, updateMore, replaceRevisionList } from '/app/cards.js';
+
+    const projectsNode = el('projects');
+    const statusNode = el('status');
+    const emptyNode = el('empty');
+    const loadingNode = el('loading');
+
+    let cfg;
+
+    const PROJECT_PAGE = 20;
+    // Matches MAX_REVISION_LIMIT in the handler: what "Show all" asks for.
+    const ALL_REVISIONS = 500;
+
+    const projectPage = { loaded: 0, total: 0 };
+
+    el('logout').addEventListener('click', (e) => { e.preventDefault(); logout(); });
+    el('refresh').addEventListener('click', () => loadProjects());
+
+    /**
+     * One page of published projects. `append` adds the next page instead of
+     * replacing the list, so "Load more" does not re-render what is already there.
+     */
+    async function loadProjects({ append = false } = {}) {
+      loadingNode.classList.remove('hidden');
+      try {
+        const offset = append ? projectPage.loaded : 0;
+        const limit = append
+          ? PROJECT_PAGE
+          : Math.max(PROJECT_PAGE, projectPage.loaded || PROJECT_PAGE);
+        const { projects, total, role } = await api('browse', { offset, limit });
+        loadingNode.classList.add('hidden');
+
+        // The response carries the role, so offering the admin link costs no extra
+        // request. Hidden again if it ever says otherwise, so a re-render after a
+        // change of account cannot leave a stale link behind.
+        el('manage').classList.toggle('hidden', role !== 'admin');
+
+        const html = projects.map((p) => projectCard(cfg, p)).join('');
+        if (append) {
+          projectsNode.insertAdjacentHTML('beforeend', html);
+          projectPage.loaded += projects.length;
+        } else {
+          projectsNode.innerHTML = html;
+          projectPage.loaded = projects.length;
+        }
+        projectPage.total = total;
+        emptyNode.classList.toggle('hidden', projectPage.total > 0);
+        updateMore(el('projectsMore'), el('projectsCount'), projectPage, 'projects');
+      } catch (err) {
+        loadingNode.classList.add('hidden');
+        setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
+      }
+    }
+
+    document.addEventListener('click', async (event) => {
+      const button = event.target.closest('[data-act]');
+      if (!button) return;
+      const { act, slug, url } = button.dataset;
+
+      try {
+        if (act === 'copy') {
+          const ok = await copyText(url);
+          const original = button.textContent;
+          button.textContent = ok ? 'Copied!' : 'Copy failed';
+          setTimeout(() => { button.textContent = original; }, 1500);
+          return;
+        }
+        if (act === 'toggle-note') {
+          // The button sits immediately after its own .note, both children of the
+          // revision's <li>, so this cannot reach a neighbouring revision's note.
+          const note = button.parentElement?.querySelector('.note');
+          if (note) {
+            const collapsed = note.classList.toggle('collapsed');
+            button.textContent = collapsed ? 'Show more' : 'Show less';
+            button.setAttribute('aria-expanded', String(!collapsed));
+          }
+          return;
+        }
+        if (act === 'more-projects') {
+          button.disabled = true;
+          try { await loadProjects({ append: true }); } finally { button.disabled = false; }
+          return;
+        }
+        if (act === 'all-revs') {
+          // Fetch this one project's full revision list and swap only its card,
+          // leaving the rest of the page alone.
+          button.disabled = true;
+          try {
+            const { projects } = await api('browse', { project: slug, revisionLimit: ALL_REVISIONS });
+            if (projects[0]) replaceRevisionList(cfg, projectsNode, projects[0]);
+          } finally {
+            // The button is gone once the swap succeeds; re-enable it if it isn't,
+            // so a failed fetch leaves something to click again.
+            if (button.isConnected) button.disabled = false;
+          }
+          return;
+        }
+      } catch (err) {
+        setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
+      }
+    });
+
+    (async () => {
+      // One origin, one token store — before requireAuth, or a signed-in user
+      // arriving on the CloudFront domain gets sent through a needless sign-in.
+      if (await canonicalizeOrigin()) return;
+      await requireAuth();
+      cfg = await getConfig();
+      startTokenRefresh();
+      await loadProjects();
+    })().catch((err) => {
+      // requireAuth rejects on purpose after starting the redirect to /login;
+      // swallowing it here keeps that from surfacing as an uncaught error.
+      if (err?.message !== 'redirecting to login') {
+        setStatus(statusNode, 'err', escapeHtml(err?.message || String(err)));
+      }
+    });
+  </script>
+</body>
+</html>

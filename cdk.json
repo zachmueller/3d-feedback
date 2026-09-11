@@ -16,6 +16,7 @@
   },
   "context": {
     "threedHost:allowedEmails": "you@example.com",
+    "threedHost:viewerEmails": "",
     "threedHost:hostedUiPrefix": "threed-host-admin",
     "threedHost:domainName": "3d.zach.nz",
     "threedHost:domainEnabled": "false",

@@ -113,6 +113,7 @@ describe('CloudFront caching', () => {
         '/app/*',
         '/login',
         '/admin',
+        '/browse',
       ]),
     );
   });
@@ -161,6 +162,20 @@ describe('HTTP API authorization', () => {
     }
   });
 
+  // The read-only catalog shares the authorizer with the admin routes, because one
+  // user pool issues both roles' tokens — so the template can only show that a
+  // token is required here. Which *role* that token has to have is the handler's
+  // job, asserted in test/handler.test.ts.
+  it('requires a token for the read-only catalog too', () => {
+    const route = routes()['POST /browse'];
+    expect(route.AuthorizationType).toBe('JWT');
+    expect(route.AuthorizerId).toBeDefined();
+  });
+
+  it('uses one authorizer for every signed-in route', () => {
+    template.resourceCountIs('AWS::ApiGatewayV2::Authorizer', 1);
+  });
+
   // Reviewers comment without signing in, so this one route is deliberately
   // open; the guardrails are the throttle below plus caps in the handler.
   it('leaves the comment route unauthenticated but throttled', () => {
@@ -199,6 +214,35 @@ describe('Cognito', () => {
       AdminCreateUserConfig: { AllowAdminCreateUserOnly: true },
       LambdaConfig: { PreSignUp: Match.anyValue() },
     });
+  });
+
+  // Both roles sign in through the same pool, so both lists have to reach both
+  // Lambdas: the trigger decides who gets an account, the handler decides what the
+  // account can do. A missing VIEWER_EMAILS on the trigger would reject every
+  // read-only sign-in at Google; a missing one on the handler would 403 every
+  // reader on /browse.
+  it('gives both Lambdas both allowlists', () => {
+    const template = synth({ 'threedHost:viewerEmails': 'reader@example.com' });
+    const functions = Object.values(template.findResources('AWS::Lambda::Function')).filter(
+      (fn) => fn.Properties.Environment?.Variables?.ALLOWED_EMAILS !== undefined,
+    );
+    expect(functions).toHaveLength(2); // the pre-signup trigger and the handler
+    for (const fn of functions) {
+      expect(fn.Properties.Environment.Variables).toMatchObject({
+        ALLOWED_EMAILS: 'me@example.com',
+        VIEWER_EMAILS: 'reader@example.com',
+      });
+    }
+  });
+
+  // Read-only access is opt-in: an existing deployment that sets nothing creates no
+  // reader accounts, rather than inheriting some default address.
+  it('creates no read-only accounts by default', () => {
+    const template = synth();
+    for (const fn of Object.values(template.findResources('AWS::Lambda::Function'))) {
+      const vars = fn.Properties.Environment?.Variables ?? {};
+      if (vars.VIEWER_EMAILS !== undefined) expect(vars.VIEWER_EMAILS).toBe('');
+    }
   });
 
   // Without credentials the Google IdP is skipped so that synth and these tests

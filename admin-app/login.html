@@ -11,7 +11,7 @@
   <div class="center">
     <div class="card login-card">
       <h1>3D models</h1>
-      <p class="subtitle">Publish models and read the feedback that comes back.</p>
+      <p class="subtitle">Browse the published models and the feedback on them.</p>
       <div id="status" class="status"></div>
       <button id="signin" class="btn">Sign in with Google</button>
       <p class="note" style="margin-top:16px">Access is restricted to approved accounts.</p>
@@ -20,7 +20,7 @@
 
   <script type="module">
     import {
-      beginLogin, handleAuthCallback, getIdToken, canonicalizeOrigin, el, setStatus,
+      beginLogin, handleAuthCallback, getIdToken, canonicalizeOrigin, HOME, el, setStatus,
     } from '/app/app.js';
 
     const statusNode = el('status');
@@ -39,10 +39,11 @@
           window.location.assign(callback.returnTo);
           return;
         }
-        // Already signed in? Go straight to the admin list.
+        // Already signed in? Go straight to the catalog, which either role can
+        // use; an admin gets a link on from there.
         const token = await getIdToken();
         if (token) {
-          window.location.assign('/admin');
+          window.location.assign(HOME);
           return;
         }
         // requireAuth tried a silent re-auth and came back with nothing, so it

@@ -11,6 +11,7 @@
   <header class="topbar">
     <div class="brand">3D models</div>
     <nav>
+      <a href="/browse">Catalog</a>
       <a href="#feedback">Feedback</a>
       <a href="#" id="logout">Sign out</a>
     </nav>
@@ -58,9 +59,16 @@
 
   <script type="module">
     import {
-      requireAuth, api, getConfig, shareUrl, logout, canonicalizeOrigin, startTokenRefresh,
-      el, setStatus, copyText, escapeHtml, fmtDate, notePreview,
+      requireAuth, api, getConfig, logout, canonicalizeOrigin, startTokenRefresh,
+      HOME, el, setStatus, copyText, escapeHtml, fmtDate,
     } from '/app/app.js';
+    import {
+      projectCard, updateMore, replaceRevisionList,
+    } from '/app/cards.js';
+
+    // Every card on this page carries its mutating buttons; /browse renders the
+    // same cards without them.
+    const CONTROLS = { controls: true };
 
     const projectsNode = el('projects');
     const statusNode = el('status');
@@ -86,132 +94,6 @@
     el('refresh').addEventListener('click', () => loadProjects());
     el('refreshFeedback').addEventListener('click', () => loadFeedback());
 
-    function fmtBytes(n) {
-      if (!n) return '';
-      return n >= 1048576 ? `${(n / 1048576).toFixed(1)} MB` : `${Math.round(n / 1024)} KB`;
-    }
-
-    function statusPill(rev) {
-      if (rev.status === 'ready') return '';
-      const kind = rev.status === 'error' ? 'err' : 'warn';
-      const title = rev.error ? ` title="${escapeHtml(rev.error)}"` : '';
-      return ` <span class="pill ${kind}"${title}>${escapeHtml(rev.status)}</span>`;
-    }
-
-    // Provenance is shown here but never edited: it is a mechanical claim about
-    // bytes that are immutable, so a hand-typed correction would be an assertion
-    // nobody could check against the model. The remedy for a wrong one is a new
-    // revision, the same as for wrong geometry. Notes and the title stay editable
-    // because they are prose, meant to be revised.
-    function sourceLine(rev) {
-      const s = rev.source;
-      if (!s) return '';
-      const where = [s.repo, s.path].filter(Boolean).join('/');
-      const parts = [
-        where,
-        s.commit ? s.commit.slice(0, 12) : '',
-        s.dirty ? 'dirty' : '',
-        s.build || '',
-      ].filter(Boolean);
-      if (!parts.length) return '';
-      const full = s.recreate || parts.join(' · ');
-      return `<div class="meta mono" title="${escapeHtml(full)}">built from ${escapeHtml(parts.join(' · '))}</div>`;
-    }
-
-    /**
-     * A revision's notes, collapsed to one line when they are long or tall enough
-     * to be worth it (notePreview decides). Both forms go into the DOM and CSS
-     * switches between them, so expanding is a class flip with nothing to re-fetch
-     * and no state to keep outside the element itself.
-     *
-     * Note the absence of whitespace between the two spans: `.note` is pre-wrap,
-     * so indentation inside it would render as a visible gap.
-     */
-    function noteBlock(rev) {
-      const text = (rev.notes || '').trim();
-      if (!text) return '<div class="note">No notes.</div>';
-      const preview = notePreview(text);
-      if (preview === null) return `<div class="note">${escapeHtml(text)}</div>`;
-      return `<div class="note collapsed"><span class="note-preview">${escapeHtml(preview)}</span>`
-        + `<span class="note-full">${escapeHtml(text)}</span></div>`
-        + `<button class="note-toggle" data-act="toggle-note" aria-expanded="false">Show more</button>`;
-    }
-
-    function revisionRow(project, rev) {
-      const url = shareUrl(cfg, project.slug, rev.rev);
-      // A revision that never finished processing has no page to link to.
-      const link = rev.status === 'ready'
-        ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener" class="mono">/${escapeHtml(project.slug)}/${rev.rev}</a>`
-        : `<span class="mono muted">/${escapeHtml(project.slug)}/${rev.rev}</span>`;
-      const comments = rev.commentCount
-        ? `<span class="pill">${rev.commentCount} comment${rev.commentCount === 1 ? '' : 's'}</span>`
-        : '';
-      return `<li>
-        <div class="revhead">
-          <strong>Rev ${rev.rev}</strong>${statusPill(rev)}
-          ${link}
-          <span class="spacer"></span>
-          ${comments}
-          <button class="btn tiny secondary" data-act="copy" data-url="${escapeHtml(url)}">Copy</button>
-          <button class="btn tiny secondary" data-act="notes" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Notes</button>
-          <button class="btn tiny danger" data-act="del-rev" data-slug="${escapeHtml(project.slug)}" data-rev="${rev.rev}">Delete</button>
-        </div>
-        ${noteBlock(rev)}
-        <div class="meta mono">${escapeHtml(fmtDate(rev.publishedAt || rev.reservedAt))} · ${escapeHtml(fmtBytes(rev.bytes))}</div>
-        ${sourceLine(rev)}
-      </li>`;
-    }
-
-    /**
-     * The revision list, plus what it is a window onto. `revisionCount` is every
-     * revision the project has; only the newest few come down with the page, so a
-     * long-running project does not make this page expensive to load.
-     */
-    function revisionList(project) {
-      const shown = project.revisions.length;
-      const total = project.revisionCount ?? shown;
-      const rows = project.revisions.map((r) => revisionRow(project, r)).join('');
-      const label = total === shown
-        ? `${total} revision${total === 1 ? '' : 's'}`
-        : `${shown} of ${total} revisions`;
-      const showAll = total > shown
-        ? `<button class="btn tiny secondary" data-act="all-revs" data-slug="${escapeHtml(project.slug)}">Show all ${total}</button>`
-        : '';
-      return `<details${total <= 3 ? ' open' : ''} data-project="${escapeHtml(project.slug)}">
-          <summary>${label}</summary>
-          <ul class="revs">${rows}</ul>
-          ${showAll ? `<div class="more">${showAll}</div>` : ''}
-        </details>`;
-    }
-
-    function projectCard(project) {
-      const latestUrl = shareUrl(cfg, project.slug);
-      const count = project.revisionCount ?? project.revisions.length;
-      return `<div class="card" data-card="${escapeHtml(project.slug)}">
-        <div class="row">
-          <div>
-            <div class="title">${escapeHtml(project.title || project.slug)}</div>
-            <div class="meta mono">${escapeHtml(project.slug)} · ${count} revision${count === 1 ? '' : 's'}${
-              project.latest ? ` · latest is rev ${project.latest}` : ' · nothing published'
-            }</div>
-          </div>
-          <div class="spacer"></div>
-          <a class="btn tiny secondary" href="${escapeHtml(latestUrl)}" target="_blank" rel="noopener">Open latest</a>
-          <button class="btn tiny secondary" data-act="copy" data-url="${escapeHtml(latestUrl)}">Copy</button>
-          <button class="btn tiny secondary" data-act="title" data-slug="${escapeHtml(project.slug)}">Rename</button>
-          <button class="btn tiny danger" data-act="del-project" data-slug="${escapeHtml(project.slug)}">Delete all</button>
-        </div>
-        ${revisionList(project)}
-      </div>`;
-    }
-
-    /** Show "20 of 63" and the Load more button, or hide the row when done. */
-    function updateMore(node, countNode, page, noun) {
-      const done = page.loaded >= page.total;
-      node.classList.toggle('hidden', done);
-      countNode.textContent = done ? '' : `Showing ${page.loaded} of ${page.total} ${noun}`;
-    }
-
     /**
      * One page of projects. `append` adds the next page instead of replacing the
      * list, so "Load more" does not re-render (or re-fetch) what is already there.
@@ -228,11 +110,12 @@
         const { projects, total } = await api('list', { offset, limit });
         loadingNode.classList.add('hidden');
 
+        const html = projects.map((p) => projectCard(cfg, p, CONTROLS)).join('');
         if (append) {
-          projectsNode.insertAdjacentHTML('beforeend', projects.map(projectCard).join(''));
+          projectsNode.insertAdjacentHTML('beforeend', html);
           projectPage.loaded += projects.length;
         } else {
-          projectsNode.innerHTML = projects.map(projectCard).join('');
+          projectsNode.innerHTML = html;
           projectPage.loaded = projects.length;
         }
         projectPage.total = total;
@@ -240,6 +123,13 @@
         updateMore(el('projectsMore'), el('projectsCount'), projectPage, 'projects');
       } catch (err) {
         loadingNode.classList.add('hidden');
+        // A 403 here means a valid session with the wrong role — a read-only
+        // account that followed a bookmark. Send it to the page it can use rather
+        // than leaving it on an admin page full of errors.
+        if (err?.status === 403) {
+          window.location.assign(HOME);
+          return;
+        }
         setStatus(statusNode, 'err', escapeHtml(err.message || String(err)));
       }
     }
@@ -329,12 +219,7 @@
           button.disabled = true;
           try {
             const { projects } = await api('list', { project: slug, revisionLimit: ALL_REVISIONS });
-            const card = projectsNode.querySelector(`[data-card="${CSS.escape(slug)}"]`);
-            const details = card?.querySelector('details');
-            if (projects[0] && details) {
-              details.outerHTML = revisionList(projects[0]);
-              card.querySelector('details').open = true;
-            }
+            if (projects[0]) replaceRevisionList(cfg, projectsNode, projects[0], CONTROLS);
           } finally {
             // The button is gone once the swap succeeds; re-enable it if it isn't,
             // so a failed fetch leaves something to click again.
