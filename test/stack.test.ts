@@ -354,7 +354,7 @@ describe('handler wiring', () => {
 
   it('runs on a supported runtime and knows where everything lives', () => {
     template.hasResourceProperties('AWS::Lambda::Function', {
-      Runtime: 'nodejs22.x',
+      Runtime: 'nodejs26.x',
       Environment: {
         Variables: Match.objectLike({
           ASSETS_BUCKET: Match.anyValue(),

@@ -25,6 +25,10 @@ import {
   HttpIamAuthorizer,
 } from 'aws-cdk-lib/aws-apigatewayv2-authorizers';
 
+// Preview runtime (no SLA). Swap to lambda.Runtime.NODEJS_26_X once CDK ships it
+// at GA; rolling back means NODEJS_24_X, the newest GA runtime.
+const NODE_RUNTIME = new lambda.Runtime('nodejs26.x', lambda.RuntimeFamily.NODEJS);
+
 /**
  * Single-stack implementation of the 3D model host (3d.zach.nz).
  *
@@ -258,7 +262,7 @@ export class ThreedHostStack extends Stack {
     const preSignUpFn = new NodejsFunction(this, 'PreSignUpFn', {
       entry: path.join(__dirname, 'lambda', 'pre-signup.ts'),
       handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_22_X,
+      runtime: NODE_RUNTIME,
       timeout: Duration.seconds(10),
       // Both lists: this trigger decides who may have an account at all, and the
       // API handler decides what each account can do with it.
@@ -343,7 +347,7 @@ export class ThreedHostStack extends Stack {
     const handlerFn = new NodejsFunction(this, 'HandlerFn', {
       entry: path.join(__dirname, 'lambda', 'handler.ts'),
       handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_22_X,
+      runtime: NODE_RUNTIME,
       // The processor copies one GLB server-side (CopyObject) and rewrites small
       // JSON objects, so it never holds a model in memory. 1024 MB is chosen for
       // CPU share on the JSON/crypto work, not for headroom.
@@ -360,12 +364,9 @@ export class ThreedHostStack extends Stack {
         SITE_URL: siteUrl,
       },
       bundling: {
-        // AWS SDK v3 is provided by the Node 22 runtime.
-        externalModules: [
-          '@aws-sdk/client-s3',
-          '@aws-sdk/s3-request-presigner',
-          '@aws-sdk/client-cloudfront',
-        ],
+        // Bundled rather than taken from the runtime: which SDK version the
+        // preview runtime carries is undocumented and may change.
+        bundleAwsSDK: true,
       },
     });
 
