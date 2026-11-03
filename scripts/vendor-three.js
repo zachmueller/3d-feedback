@@ -5,7 +5,7 @@
  *
  * The viewer is deliberately build-free: index.html declares an import map that
  * points the bare "three" specifier at vendor/three.module.js, and the examples
- * modules (GLTFLoader, OrbitControls, RoomEnvironment) are served as-is. Those
+ * modules (GLTFLoader, TrackballControls, RoomEnvironment) are served as-is. Those
  * modules import each other by relative path, though, so this script walks the
  * import graph from the entry points, copies every file it reaches, and rewrites
  * each relative specifier to a flat "./<basename>" in the vendor directory.
@@ -27,7 +27,7 @@ const outDir = path.join(root, 'viewer-app', 'vendor');
 const ENTRIES = [
   'build/three.module.js',
   'examples/jsm/loaders/GLTFLoader.js',
-  'examples/jsm/controls/OrbitControls.js',
+  'examples/jsm/controls/TrackballControls.js',
   'examples/jsm/environments/RoomEnvironment.js',
 ];
 

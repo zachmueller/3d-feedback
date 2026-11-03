@@ -254,6 +254,43 @@ html, body {
   flex: none;
 }
 
+/* --- navigation cube ------------------------------------------------------ */
+
+#viewCube {
+  position: absolute;
+  right: calc(8px + env(safe-area-inset-right));
+  bottom: calc(8px + env(safe-area-inset-bottom));
+  width: 112px;
+  height: 112px;
+  touch-action: none;
+  background: transparent;
+}
+
+/* Below ~640px the centred revision pill reaches the right edge, so the cube
+   sits above it rather than on top of it. */
+@media (max-width: 700px) {
+  #viewCube {
+    width: 84px;
+    height: 84px;
+    bottom: calc(60px + env(safe-area-inset-bottom));
+  }
+}
+
+/* Keeps the "Copied" flash from reflowing the toolbar. */
+#copyView { min-width: 84px; }
+
+/* --- bare mode (?bare=1): the canvas alone, for screenshots ---------------- */
+
+body.bare #topbar,
+body.bare #revnav,
+body.bare #partsPanel,
+body.bare #viewCube,
+body.bare #below,
+body.bare #loading { display: none !important; }
+
+/* #error stays, so a failed load shows up in the screenshot as a reason. */
+body.bare #stage { height: 100vh; height: 100dvh; min-height: 0; }
+
 /* --- below the canvas ----------------------------------------------------- */
 
 #below {
@@ -355,7 +392,71 @@ html, body {
   overflow-wrap: anywhere;
 }
 
+/* A view reference inside a comment: a chip that moves the camera. */
+.viewref {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 1px;
+  padding: 0 8px;
+  border: 1px solid var(--accent);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: nowrap;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+
+.viewref:hover,
+.viewref:focus-visible {
+  background: var(--accent);
+  color: #fff;
+}
+
 /* --- form ----------------------------------------------------------------- */
+
+.composer { position: relative; }
+
+.atmenu {
+  position: absolute;
+  left: 8px;
+  top: 100%;
+  margin-top: 4px;
+  z-index: 2;
+  padding: 4px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+
+.atmenu [role='option'] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 6px;
+  background: var(--surface-alt);
+  color: var(--text);
+  font: inherit;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.atmenu [role='option']:focus-visible { outline: 2px solid var(--accent); }
+
+.atmenu kbd {
+  padding: 0 5px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--muted);
+  font: inherit;
+  font-size: 11px;
+}
 
 #commentForm {
   display: grid;

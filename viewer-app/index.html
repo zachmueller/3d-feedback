@@ -47,7 +47,8 @@
       <div class="toolbar">
         <button id="partsToggle" class="btn small secondary" aria-expanded="false"
                 aria-controls="partsPanel">Parts</button>
-        <button id="resetView" class="btn small secondary" title="Reset the camera">Reset</button>
+        <button id="copyView" class="btn small secondary" title="Copy a link that opens on exactly this view">Copy view</button>
+        <button id="resetView" class="btn small secondary" title="Back to the opening view">Reset</button>
       </div>
     </header>
 
@@ -66,6 +67,12 @@
       </div>
       <ul id="partsList"></ul>
     </aside>
+
+    <!-- Navigation cube: turns with the model; click a face, edge or corner to
+         look from there. Labelled in the model's own axes, Z up. -->
+    <canvas id="viewCube" class="hidden" role="img"
+            aria-label="Navigation cube. Click a face, edge or corner to look from that side."
+            title="Click a face, edge or corner to look from there (corners give isometric views)"></canvas>
   </div>
 
   <main id="below" class="hidden">
@@ -94,10 +101,23 @@
         <label for="commentName">Your name</label>
         <input id="commentName" name="name" type="text" maxlength="60" placeholder="Name" />
         <label for="commentText">Comment</label>
-        <textarea id="commentText" name="text" rows="4" maxlength="4000"
-                  placeholder="What should change?" required></textarea>
+        <!-- Typing "@" at the start of a word offers the current view; the button
+             below does the same. Each becomes a clickable view reference. -->
+        <div class="composer">
+          <textarea id="commentText" name="text" rows="4" maxlength="4000"
+                    placeholder="What should change? Type @ to point at the current view."
+                    aria-controls="atMenu" aria-expanded="false" aria-autocomplete="list"
+                    required></textarea>
+          <div id="atMenu" class="atmenu hidden" role="listbox" aria-label="Insert">
+            <button id="atInsertView" type="button" role="option" aria-selected="true">
+              Insert current view <kbd>Enter</kbd>
+            </button>
+          </div>
+        </div>
         <div class="formrow">
           <button id="commentSubmit" class="btn" type="submit">Post comment</button>
+          <button id="insertView" class="btn tiny secondary" type="button"
+                  title="Insert a reference to the camera view you are looking at now">Insert current view</button>
           <span id="commentStatus" class="status"></span>
         </div>
       </form>

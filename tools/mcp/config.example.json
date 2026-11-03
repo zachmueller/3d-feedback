@@ -53,5 +53,13 @@
   "enabledTools": [],
 
   "logLevel": "info",
-  "logFile": null
+  "logFile": null,
+
+  "_readme_render": [
+    "render_view screenshots the viewer from a view reference by driving a local Chrome headlessly.",
+    "chromePath: null searches PATH, then the usual Chrome/Chromium install locations.",
+    "renderTimeoutSeconds covers the page load, the model download and the first frame together."
+  ],
+  "chromePath": null,
+  "renderTimeoutSeconds": 60
 }

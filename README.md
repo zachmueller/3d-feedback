@@ -12,9 +12,10 @@ https://3d.zach.nz/towel-clip        the latest revision
 The workflow it exists for: iterate on a design in FreeCAD, publish a snapshot
 from the CLI, send the link, read the comments, iterate again.
 
-Reviewers need no account — they orbit/zoom/pan the model in the browser, toggle
-individual parts of an assembly, step through earlier revisions, and leave
-feedback. Publishing and administration are yours alone; a second, read-only
+Reviewers need no account — they tumble/zoom/pan the model in the browser, snap to
+a side from the navigation cube, toggle individual parts of an assembly, step
+through earlier revisions, and leave feedback that can point at exactly the view
+they mean. Publishing and administration are yours alone; a second, read-only
 allowlist can sign in to **`/browse`** and see everything published without being
 able to change any of it.
 
@@ -155,6 +156,106 @@ incoming URI, before the function rewrites it.** So `/<proj>/<rev>` is served by
 the *default* behavior, which is why the default behavior has a 60-second TTL and
 the only 1-year cache is the separate `*.glb` behavior. `test/stack.test.ts`
 asserts this, because getting it wrong caches every share URL for a year.
+
+## The viewer: trackball, navigation cube and view references
+
+### Moving around
+
+The camera is a **trackball**, not an orbit. OrbitControls keeps the camera's up
+fixed and stops dead at the poles, so a view just past straight-down could only be
+reached by swinging all the way round the other way; a trackball tumbles in any
+direction. Left-drag tumbles, right-drag pans, the wheel or a trackpad pinch zooms,
+and on a phone one finger tumbles and two pinch and pan.
+
+Wheel zoom is handled by the viewer itself rather than the controls, on the event,
+exponentially. Both stock behaviours were wrong on a Mac: OrbitControls applied the
+dolly inside its wheel handler and recorded the result, so the render-on-demand
+loop saw nothing to draw and the zoom only appeared when something else moved; and
+TrackballControls damps the wheel and scales it for a notched mouse, which a
+trackpad's stream of tiny deltas — and a pinch, which macOS delivers as ctrl+wheel —
+barely moves.
+
+A tumbled camera can end up rolled. The **navigation cube** in the corner puts it
+back. It turns with the model, and each face is drawn as a faint 3×3 grid: the
+middle square looks straight at that side, a square along an edge looks along the
+edge's diagonal (45° between the two faces), and a corner square looks from the
+corner — a true isometric view, 35.26° up. That is 26 directions, each a short
+glide that keeps the zoom and pan. Hovering lights up the whole region a click
+would pick, across every face that shares it, so a corner shows as one target on
+its three faces; on a phone it lights up while the finger is down. **Reset** glides
+back to the opening view.
+
+A glide slerps the camera's orientation to the end pose's, and the end pose is
+computed with the camera convention (`Matrix4.lookAt(eye, target, up)`, what
+`camera.lookAt` uses), so its last frame *is* the resting state. An earlier version
+used a plain `Object3D.lookAt`, which aims +Z rather than a camera's −Z at the
+target: every glide headed for the mirror-image view and flipped round at the end.
+
+The cube's labels and its X/Y/Z triad are in the **model's** axes, Z up, the frame
+the part was designed in — not three.js's Y-up scene. Exports map Z-up to glTF's
+Y-up as (x, y, z) → (x, z, −y), and the viewer undoes that for everything it shows a
+person. The conventions are FreeCAD's: Front looks at the XZ plane from −Y, Right
+from +X, and Top looks down Z with +Y up the screen (Bottom, its mirror, with −Y up
+the screen and +X still on the right).
+
+### View references
+
+A comment can say exactly where it is looking from, the way a video comment can
+carry a timestamp:
+
+```
+the arm looks thin from underneath @view(az=-35,el=-20,zoom=1.6) and the gap to
+the wall is tight @view(az=90,el=10,zoom=1.2,parts=111)
+```
+
+Each one renders as a chip; clicking it glides the camera there, restores the parts
+it recorded and scrolls the model back into view. A comment can hold as many as it
+likes. The author never types one: **Insert current view** under the comment box
+drops the current view at the caret, and so does typing `@` at the start of a word
+and pressing Enter.
+
+| Field | Meaning | Written when |
+|---|---|---|
+| `az` | Degrees about the vertical: the direction the camera looks *from*. 0 = Front (−Y), 90 = Right (+X), 180 = Back, −90 = Left | always |
+| `el` | Degrees above the XY plane: 90 = Top, −90 = Bottom | always |
+| `zoom` | Framing distance ÷ current distance, so 2 is twice as close. Independent of the model's size and the window's shape | always |
+| `roll` | Degrees the camera is turned about its view axis, away from "Z up the screen" (at a pole: from "+Y up", or "−Y up" looking from below) | non-zero |
+| `pan` | The point looked at, as `x,y,z` model units (mm) from the model's bounding-sphere centre | non-zero |
+| `parts` | One digit per parts-panel entry, in panel order, 1 = shown | differs from the panel's defaults |
+
+Angles round to 0.1°, zoom and pan to 0.01; looking straight down or up, `az` is
+written as 0, because roll carries the orientation there. A token that does not
+parse is shown as the text it is rather than moving the camera somewhere surprising.
+`parts` is positional, so a token carried to a revision whose panel has a different
+number of entries keeps its camera and ignores the parts.
+
+Nothing server-side knows about view references. They are ordinary comment text —
+`sanitizeText` keeps every character they use — and are parsed where they are read:
+by the viewer, and by the MCP server's `get_feedback` and `render_view`. The parser
+and the camera maths are [viewer-app/viewref.js](viewer-app/viewref.js), with a
+TypeScript copy at [tools/mcp/viewref.ts](tools/mcp/viewref.ts) for the server;
+[test/viewref.test.ts](test/viewref.test.ts) runs one table through both, the way
+the parts-panel pair below is pinned.
+
+### Deep links and bare mode
+
+Without the `@`, a reference is a share-URL fragment, and the viewer opens on it:
+
+```
+https://3d.zach.nz/towel-clip/3#view(az=-35,el=22,zoom=1.6)
+```
+
+**Copy view** in the toolbar copies exactly that for the current camera. The
+address bar is never rewritten as the camera moves, so a link copied from it is the
+one that was sent. The fragment survives the redirect from a bare `/<proj>` to the
+latest revision.
+
+`?bare=1` hides the title bar, revision pill, parts panel, navigation cube and
+everything below the canvas, for screenshots. Anything driving the page can wait on
+`document.documentElement.dataset.viewerState`: `loading`, then `ready` once the
+model is framed, the parts panel built, the fragment applied and a frame drawn —
+with `dataset.viewerView` saying which view was applied — or `error`, with the
+reason in `#errorTitle`/`#errorText`. That is the contract `render_view` relies on.
 
 ## Revision numbering
 
@@ -433,9 +534,10 @@ Register it by pointing the harness at the same command:
 }
 ```
 
-Ten tools. Six write or export; four only read, and those four need no credentials
-at all — the manifests, comment threads and status objects they read are the same
-public objects the viewer reads, straight off the distribution.
+Eleven tools. Six write or export; five only read, and those five need no
+credentials at all — the manifests, comment threads and status objects they read
+are the same public objects the viewer reads, straight off the distribution.
+`render_view` additionally needs a Chrome or Chromium on the machine.
 
 | Tool | Does |
 |---|---|
@@ -447,8 +549,9 @@ public objects the viewer reads, straight off the distribution.
 | `convert_and_publish` | Export → inspect → publish in one call |
 | `list_revisions` | What a reviewer can see: title, latest, every published revision with its notes, size, comment count, URL and the commit it was built from |
 | `get_publish_status` | Whether a publish landed — `ready` with the URL and the commit, `error` with the processor's reason, or still `processing`. The tool for a publish whose wait timed out |
-| `get_feedback` | The comments on one revision, or across the project, newest first |
+| `get_feedback` | The comments on one revision, or across the project, newest first, with any [view references](#view-references) parsed (`views`) and turned into deep links (`viewUrls`) |
 | `verify_revision` | Fetch the share page and the model as a reviewer would: status, content type, immutable caching, and that the size served matches the manifest |
+| `render_view` | A PNG of a revision from an exact view — a reference copied out of a comment, a share URL ending in one, or the numbers — so an agent can see what a reviewer saw. Loads the real share page with `?bare=1` in a headless local Chrome and waits for the viewer to report `ready` |
 
 Editing, deleting and listing *every* project are deliberately absent: those routes
 are Cognito-only (`/admin` and `/browse`), and a headless server cannot complete a
@@ -466,6 +569,13 @@ The parts prediction in `inspect_glb` mirrors `viewer-app/viewer.js`, so it
 answers "will the reviewer see the checkboxes I expect?" without a publish.
 [test/mcp-glb.test.ts](test/mcp-glb.test.ts) pins the pair against the same sample
 model the dev server uses, because two implementations of one rule drift.
+
+`render_view` drives a browser that is already installed, through `puppeteer-core`,
+rather than bundling Chromium (~170 MB on every `npm install`) or reimplementing the
+viewer server-side — so the picture is exactly what the viewer draws. Each call
+launches a separate headless instance with a throwaway profile and closes it
+afterwards. It uses Chrome's default GPU path, which on a Mac is hardware WebGL
+through Metal: forcing SwiftShader there crashed the browser.
 
 ### Configuration
 
@@ -503,6 +613,8 @@ lists them all). Precedence, reported per key by `check_setup`:
 | `THREED_ENABLED_TOOLS` | `enabledTools` | all; a comma list narrows the surface |
 | `THREED_LOG_LEVEL` | `logLevel` | `info` (stderr) |
 | `THREED_LOG_FILE` | `logFile` | none |
+| `THREED_CHROME_PATH` | `chromePath` | PATH (`google-chrome`, `chromium`…), then `/Applications/Google Chrome.app/…` and the usual Linux paths; `render_view` refuses without one |
+| `THREED_RENDER_TIMEOUT_SECONDS` | `renderTimeoutSeconds` | 60 (page load, model download and first frame together) |
 
 No credentials are configured here, only a profile *name*: the AWS SDK's provider
 chain resolves it the way the CLI does, including the SSO cache that
@@ -522,6 +634,11 @@ else reaches stdout.
 npm install          # also vendors three.js into viewer-app/vendor/
 npm run dev          # http://localhost:8080/sample/1
 ```
+
+Also worth opening: `http://localhost:8080/sample/1#view(az=90,el=10,zoom=1.2,parts=111)`
+(a deep link that also turns the reference wall on) and the same with `?bare=1`
+before the `#`. The fixture thread on revision 1 carries two view references and a
+malformed one that must stay plain text.
 
 The dev server stands in for CloudFront, S3 and the API, and it routes URLs by
 executing the **real** `lib/cloudfront-functions/*.js`, so a routing change is
@@ -617,13 +734,14 @@ in a second pass.
 | `lib/lambda/pre-signup.ts` | Cognito allowlist trigger |
 | `lib/cloudfront-functions/` | Viewer-request URL rewriting |
 | `viewer-app/` | Public viewer SPA (three.js, no build step) |
+| `viewer-app/viewref.js` | View references: token grammar and camera maths, mirrored by `tools/mcp/viewref.ts` |
 | `admin-app/` | Signed-in SPAs — `admin.html`, the read-only `browse.html`, `login.html` (Google PKCE, no build step) |
 | `admin-app/cards.js` | Project/revision cards both pages render; `controls` adds the mutating buttons |
 | `tools/publish.sh` | Publish a revision, print the share URL (a wrapper over `tools/mcp/cli.ts`) |
 | `tools/parent-dns.sh` | The subdomain's records in the parent `zach.nz` zone |
 | `tools/freecad_export_glb.py` | FreeCAD → `.glb` export |
 | `tools/freecad_selftest.py` | Exporter selection rules, against a fixture document |
-| `tools/mcp/` | stdio MCP server *and* the publish client both entry points share: export, inspect, publish, read back |
+| `tools/mcp/` | stdio MCP server *and* the publish client both entry points share: export, inspect, publish, read back, render (`render.ts`) |
 | `scripts/` | three.js vendoring, sample model, dev server, MCP stdio smoke test |
 | `test/` | Stack assertions + handler, edge-function and MCP units |
 
@@ -655,6 +773,12 @@ in a second pass.
   viewer's own objects are public, so every read starts from a slug you already
   know. Adding the rest would mean IAM-authorised variants of those routes in the
   stack.
+- `render_view` needs a Chrome or Chromium on the machine running the MCP server,
+  and takes a few seconds per image. On a machine with no GPU it falls back to
+  software WebGL, which is slower and can differ slightly from what a reviewer sees.
+- The navigation cube and view references assume the export's Z-up → Y-up mapping
+  (FreeCAD's and `3d-models`'). A `.glb` authored Y-up natively would show "Top"
+  on its front.
 - Reads go through a 5-second CDN cache (10s max), so a comment or a manifest can
   lag by that much; CloudFront does not honour a `cache-control: no-cache` request
   header from the viewer. Publishing accounts for it in its polling deadline.

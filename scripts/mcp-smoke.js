@@ -134,6 +134,7 @@ const textOf = (response) =>
     'inspect_glb',
     'list_revisions',
     'publish_model',
+    'render_view',
     'verify_revision',
   ];
   check(

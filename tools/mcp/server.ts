@@ -43,6 +43,7 @@ import { checkSetup, type SetupReport } from './doctor';
 import { exportGlb, guiExportSnippet } from './freecad';
 import { formatBytes, GlbError, type GlbReport, inspectGlb, summarizeSource } from './glb';
 import { PublishError, publishModel, type PublishResult } from './publish';
+import { RenderError, type RenderResult, renderView } from './render';
 import {
   describeStatus,
   type FeedbackItem,
@@ -57,6 +58,7 @@ import {
   type VerifyReport,
   verifyRevision,
 } from './site';
+import { describeView } from './viewref';
 
 // --- logging (stderr only) ---------------------------------------------------
 
@@ -83,7 +85,7 @@ function makeLogger(loaded: LoadedConfig) {
 // --- tool results ------------------------------------------------------------
 
 type ToolResult = {
-  content: Array<{ type: 'text'; text: string }>;
+  content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>;
   isError?: boolean;
 };
 
@@ -97,6 +99,12 @@ function ok(summary: string[], data: unknown): ToolResult {
     '```',
   ].join('\n');
   return { content: [{ type: 'text', text }] };
+}
+
+/** An image first — the thing asked for — then the usual summary and JSON. */
+function okImage(summary: string[], data: unknown, pngBase64: string): ToolResult {
+  const text = ok(summary, data).content[0];
+  return { content: [{ type: 'image', data: pngBase64, mimeType: 'image/png' }, text] };
 }
 
 /**
@@ -115,7 +123,8 @@ function fail(err: unknown, log: ReturnType<typeof makeLogger>): ToolResult {
     err instanceof GlbError ||
     err instanceof SiteError ||
     err instanceof CredentialError ||
-    err instanceof PublishError;
+    err instanceof PublishError ||
+    err instanceof RenderError;
   const message = err instanceof Error ? err.message : String(err);
   log(expected ? 'info' : 'error', 'tool failed', {
     message,
@@ -228,8 +237,20 @@ function feedbackSummary(project: string, items: FeedbackItem[], revisions: numb
   for (const item of items) {
     lines.push(`  [${item.at?.slice(0, 16).replace('T', ' ')}] ${item.name} on revision ${item.revision}`);
     for (const line of item.text.split('\n')) lines.push(`      ${line}`);
+    // Each reference the comment makes, as the link that opens on it: what to
+    // hand to render_view, or to a person.
+    item.views.forEach((view, i) => lines.push(`      ↳ ${describeView(view)}: ${item.viewUrls[i]}`));
   }
   return lines;
+}
+
+function renderSummary(result: RenderResult): string[] {
+  return [
+    `Rendered ${result.project} revision ${result.revision} at ${describeView(result.view)}, ` +
+      `${result.width}×${result.height}.`,
+    `A person opens the same view at ${result.url}`,
+    ...(result.out ? [`Saved to ${result.out}`] : []),
+  ];
 }
 
 function statusSummary(status: StatusObject, siteUrl: string): string[] {
@@ -256,6 +277,21 @@ function setupSummary(report: SetupReport): string[] {
 }
 
 // --- schema fragments --------------------------------------------------------
+
+/**
+ * The view-reference syntax, said once and used in every description that
+ * mentions it, so a caller reading any one of them can write or read a token.
+ */
+const VIEW_REFERENCE_HELP =
+  'A comment can pin the camera with a view reference: `@view(az=-35,el=22,zoom=1.6)`, plus ' +
+  'optional `roll=<deg>`, `pan=<x>,<y>,<z>` and `parts=<digits>`. Angles are degrees in the ' +
+  "MODEL's axes, Z up, matching the viewer's navigation cube: az is the compass direction the " +
+  'camera looks FROM (0 = Front, the -Y side; 90 = Right, +X; 180 = Back; -90 = Left), el is ' +
+  'height above the XY plane (90 = Top, -90 = Bottom), roll turns the camera about its view ' +
+  'axis. zoom is relative to the opening framing (2 = twice as close). pan moves the point ' +
+  "looked at, in model units (mm) from the model's centre. parts has one digit per parts-panel " +
+  'entry in panel order, 1 = shown; it is omitted when the default parts are shown. Without the ' +
+  '"@" the same text is a share-URL fragment: <share url>#view(az=-35,el=22,zoom=1.6).';
 
 const projectField = z
   .string()
@@ -778,7 +814,11 @@ function registerTools(
           'newest first. This closes the loop the host exists for: publish, send the link, read ' +
           'what came back, iterate. Comments are public and anonymous-capable, so treat the names ' +
           'as self-reported. Deleting a comment is not possible here — that means deleting the ' +
-          'revision or the project from /admin.',
+          'revision or the project from /admin.\n\n' +
+          VIEW_REFERENCE_HELP +
+          ' Each item carries its references parsed, in order, as `views`, and as share links that ' +
+          'open on them as `viewUrls`. Pass one to render_view to see what the reviewer was ' +
+          'looking at when they wrote it.',
         annotations: { readOnlyHint: true, openWorldHint: true },
         inputSchema: {
           project: projectField,
@@ -850,6 +890,77 @@ function registerTools(
       },
     );
   }
+  if (enabled('render_view')) {
+    server.registerTool(
+      'render_view',
+      {
+        title: 'See a revision from a given view',
+        description:
+          'Render a published revision from an exact camera view and return it as a PNG — what a ' +
+          'reviewer saw when they wrote a view reference into a comment, or any view worth ' +
+          'checking. It loads the real share page in a local headless Chrome, so the image is ' +
+          'exactly what the viewer draws, with the viewer chrome hidden by default.\n\n' +
+          VIEW_REFERENCE_HELP +
+          '\n\nNeeds no AWS credentials, only a Chrome or Chromium on this machine (THREED_CHROME_PATH; ' +
+          'check_setup reports whether one was found). One render takes a few seconds.',
+        annotations: { readOnlyHint: true, openWorldHint: true },
+        inputSchema: {
+          project: readProjectField,
+          revision: readRevisionField,
+          view: z
+            .union([
+              z.string(),
+              z.object({
+                az: z.number().describe('Degrees: 0 = Front (-Y), 90 = Right (+X), 180 = Back, -90 = Left.'),
+                el: z.number().describe('Degrees above the XY plane: 90 = Top, -90 = Bottom.'),
+                zoom: z.number().positive().optional().describe('Relative to the opening framing. Default 1.'),
+                roll: z.number().optional().describe('Degrees about the view axis. Default 0.'),
+                pan: z
+                  .tuple([z.number(), z.number(), z.number()])
+                  .optional()
+                  .describe("Point looked at, model units from the model's centre. Default [0, 0, 0]."),
+                parts: z
+                  .string()
+                  .regex(/^[01]+$/)
+                  .optional()
+                  .describe('One digit per parts-panel entry, 1 = shown. Default: the panel defaults.'),
+              }),
+            ])
+            .describe(
+              'The view: a reference as written in a comment (`@view(az=-35,el=22,zoom=1.6)`), the ' +
+                'fragment form (`view(...)`), a whole share URL that ends in one, or the numbers as an object.',
+            ),
+          width: z.number().int().optional().describe('Image width in pixels (64-3000). Default 1200.'),
+          height: z.number().int().optional().describe('Image height in pixels (64-3000). Default 800.'),
+          bare: z
+            .boolean()
+            .optional()
+            .describe('Hide the title bar, revision pill, parts panel and navigation cube. Default true.'),
+          out: z.string().optional().describe('Also save the PNG here (must end in .png).'),
+        },
+      },
+      async ({ project, revision, view, width, height, bare, out }) => {
+        try {
+          const slug = resolveProject(cfg, project);
+          const reader = siteReader(cfg);
+          log('info', 'render_view', { project: slug, revision, view });
+          const result = await renderView(cfg, reader, {
+            project: slug,
+            revision: revision ?? null,
+            view,
+            width,
+            height,
+            bare,
+            out: out ?? null,
+          });
+          const { png, ...data } = result;
+          return okImage(renderSummary(result), data, png);
+        } catch (err) {
+          return fail(err, log);
+        }
+      },
+    );
+  }
 }
 
 const INSTRUCTIONS = [
@@ -881,6 +992,13 @@ const INSTRUCTIONS = [
   'Editing notes, deleting a revision and listing every project are not available here:',
   'those routes need a Google sign-in, so they live in the /admin app. Provenance cannot be',
   'edited at all, by anyone: it describes bytes that are immutable, so the fix is a new revision.',
+  '',
+  'Reviewers can point at exactly what they mean: a comment may contain view references,',
+  '`@view(az=-35,el=22,zoom=1.6)`, each pinning a camera angle, zoom and (optionally) which',
+  'parts were shown. get_feedback returns them parsed (`views`) and as deep links (`viewUrls`),',
+  "and render_view screenshots the model from one, so you can see what the reviewer saw rather",
+  'than guess. Angles are in the model\'s axes, Z up: az 0 = Front (-Y), 90 = Right (+X),',
+  'el 90 = Top. The same text without the "@" is a share-URL fragment.',
   '',
   'Run check_setup when anything fails: it names the broken link and its fix.',
 ].join('\n');

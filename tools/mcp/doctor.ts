@@ -97,6 +97,25 @@ function probeFile(name: string, file: string, envVar: string): Probe {
   };
 }
 
+/**
+ * Whether render_view has a browser to drive. Existence only: running even
+ * `--version` starts the binary, and a check is not worth a browser launch.
+ * Not-found is `null`, not a failure, because nothing else depends on it.
+ */
+function probeChrome(cfg: Config): Probe {
+  if (cfg.chromePath && fs.existsSync(cfg.chromePath)) {
+    return { name: 'chrome', ok: true, detail: `${cfg.chromePath} (for render_view)` };
+  }
+  return {
+    name: 'chrome',
+    ok: cfg.chromePath ? false : null,
+    detail: cfg.chromePath
+      ? `${cfg.chromePath} is missing`
+      : 'no Chrome or Chromium found — render_view will refuse to run',
+    fix: 'Set THREED_CHROME_PATH (config key chromePath) to a Chrome or Chromium binary.',
+  };
+}
+
 function probeWorkDir(cfg: Config): Probe {
   try {
     fs.mkdirSync(cfg.workDir, { recursive: true });
@@ -199,6 +218,7 @@ export async function checkSetup(
   probes.push(probeEndpoint('apiUrl', cfg.apiUrl, loaded.sources.apiUrl));
   probes.push(probeEndpoint('siteUrl', cfg.siteUrl, loaded.sources.siteUrl));
   probes.push(await probeSite(cfg));
+  probes.push(probeChrome(cfg));
   if (loaded.outputsProblem) {
     // Tolerated at load time so the export tools still work, but never silent.
     probes.push({

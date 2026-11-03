@@ -14,6 +14,7 @@ import {
   accountFromArn,
   activeTools,
   ConfigError,
+  findChrome,
   isInside,
   loadConfig,
   PathError,
@@ -73,6 +74,33 @@ describe('defaults', () => {
     const { values, sources } = load({ AWS_PROFILE: 'ambient' });
     expect(values.awsProfile).toBe('ambient');
     expect(sources.awsProfile).toBe('default');
+  });
+});
+
+describe('render_view settings', () => {
+  it('gives the render its own, longer deadline', () => {
+    expect(load().values.renderTimeoutSeconds).toBe(60);
+    expect(load({ THREED_RENDER_TIMEOUT_SECONDS: '90' }).values.renderTimeoutSeconds).toBe(90);
+    expect(() => load({ THREED_RENDER_TIMEOUT_SECONDS: 'soon' })).toThrow(ConfigError);
+  });
+
+  it('takes THREED_CHROME_PATH over the config file, and reports where it came from', () => {
+    const file = writeConfig({ chromePath: '/opt/from-file/chrome' });
+    const fromFile = load({ THREED_CONFIG: file });
+    expect(fromFile.values.chromePath).toBe('/opt/from-file/chrome');
+    expect(fromFile.sources.chromePath).toBe('file');
+    const fromEnv = load({ THREED_CONFIG: file, THREED_CHROME_PATH: '/opt/from-env/chrome' });
+    expect(fromEnv.values.chromePath).toBe('/opt/from-env/chrome');
+    expect(fromEnv.sources.chromePath).toBe('env');
+  });
+
+  it('looks on PATH first, then the usual install locations, and settles for null', () => {
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'chromium'), '', { mode: 0o755 });
+    expect(findChrome({ PATH: bin }, () => false)).toBe(path.join(bin, 'chromium'));
+    expect(findChrome({ PATH: '' }, (f) => f === '/usr/bin/chromium')).toBe('/usr/bin/chromium');
+    expect(findChrome({ PATH: '' }, () => false)).toBeNull();
   });
 });
 
@@ -242,7 +270,7 @@ describe('the tool surface', () => {
     expect(tools).toContain('inspect_glb');
     // The read tools write nothing, so a read-only harness keeps them.
     expect(tools).toEqual(
-      expect.arrayContaining(['list_revisions', 'get_publish_status', 'get_feedback', 'verify_revision']),
+      expect.arrayContaining(['list_revisions', 'get_publish_status', 'get_feedback', 'verify_revision', 'render_view']),
     );
   });
 

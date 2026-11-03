@@ -52,6 +52,7 @@ export const TOOL_NAMES = [
   'get_publish_status',
   'get_feedback',
   'verify_revision',
+  'render_view',
 ] as const;
 
 export type ToolName = (typeof TOOL_NAMES)[number];
@@ -101,6 +102,10 @@ export interface Config {
   enabledTools: ToolName[];
   logLevel: LogLevel;
   logFile: string | null;
+  /** The Chrome or Chromium binary render_view drives headlessly; null when none was found. */
+  chromePath: string | null;
+  /** Deadline for render_view's page load, model download and first frame together. */
+  renderTimeoutSeconds: number;
 }
 
 export interface LoadedConfig {
@@ -153,6 +158,8 @@ const FILE_KEYS = new Set<string>(
     'enabledTools',
     'logLevel',
     'logFile',
+    'chromePath',
+    'renderTimeoutSeconds',
   ] satisfies Array<keyof Config>).map(String),
 );
 
@@ -237,6 +244,34 @@ export function findFreecadcmd(env: Record<string, string | undefined>): string 
   return (
     whichBinary('freecadcmd', env) ?? (fs.existsSync(MACOS_FREECADCMD) ? MACOS_FREECADCMD : null)
   );
+}
+
+/**
+ * A Chrome or Chromium for render_view: PATH first (the Linux names), then the
+ * usual install locations. Nothing is downloaded — puppeteer-core drives whatever
+ * browser is already there, which keeps a ~170 MB Chromium out of `npm install`.
+ */
+const CHROME_NAMES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
+const chromeLocations = (): string[] => [
+  '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome',
+  path.join(os.homedir(), 'Applications/Google Chrome.app/Contents/MacOS/Google Chrome'),
+  '/Applications/Chromium.app/Contents/MacOS/Chromium',
+  '/usr/bin/google-chrome',
+  '/usr/bin/google-chrome-stable',
+  '/usr/bin/chromium',
+  '/usr/bin/chromium-browser',
+  '/snap/bin/chromium',
+];
+
+export function findChrome(
+  env: Record<string, string | undefined>,
+  exists: (file: string) => boolean = fs.existsSync,
+): string | null {
+  for (const name of CHROME_NAMES) {
+    const found = whichBinary(name, env);
+    if (found) return found;
+  }
+  return chromeLocations().find((file) => exists(file)) ?? null;
 }
 
 // --- value parsers -----------------------------------------------------------
@@ -496,6 +531,19 @@ export function loadConfig(opts: LoadOptions = {}): LoadedConfig {
       { def: () => 'info' as LogLevel },
     ),
     logFile: pick<string | null>('logFile', 'THREED_LOG_FILE', asPath, { def: () => null }),
+
+    chromePath: pick<string | null>('chromePath', 'THREED_CHROME_PATH', asPath, {
+      def: () => findChrome(env),
+    }),
+    // Its own knob, not httpTimeoutSeconds: loading the page, downloading the
+    // model and drawing a frame is several requests and a render, and a large
+    // model legitimately takes longer than one request's deadline.
+    renderTimeoutSeconds: pick(
+      'renderTimeoutSeconds',
+      'THREED_RENDER_TIMEOUT_SECONDS',
+      (raw, where) => parseNumber(raw, where, { min: 1 }),
+      { def: () => 60 },
+    ),
   };
 
   return {

@@ -32,6 +32,7 @@ import {
 
 import type { Config } from './config';
 import { errorDetail, type FetchLike, type HttpResult, nodeFetch, parseJson, request } from './http';
+import { formatViewFragment, splitViewTokens, type View } from './viewref';
 
 /** Caller-fixable problem with a site read: no site URL, or a bad response. */
 export class SiteError extends Error {
@@ -209,6 +210,16 @@ export interface FeedbackItem extends Comment {
   project: string;
   revision: number;
   url: string;
+  /** The comment's `@view(...)` references, parsed, in the order they appear. */
+  views: View[];
+  /** The same views as share links that open on them: `<url>#view(...)`. */
+  viewUrls: string[];
+}
+
+/** The view references in a comment, and a deep link for each. */
+export function commentViews(text: string, url: string): { views: View[]; viewUrls: string[] } {
+  const views = splitViewTokens(text ?? '').flatMap((segment) => ('view' in segment ? [segment.view] : []));
+  return { views, viewUrls: views.map((view) => `${url}#${formatViewFragment(view)}`) };
 }
 
 /**
@@ -243,7 +254,8 @@ export async function fetchFeedback(
       if (comments === null) continue;
       revisionsRead.push(rev);
       for (const comment of comments) {
-        items.push({ ...comment, project: slug, revision: rev, url: shareUrlFor(reader.siteUrl, slug, rev) });
+        const url = shareUrlFor(reader.siteUrl, slug, rev);
+        items.push({ ...comment, project: slug, revision: rev, url, ...commentViews(comment.text, url) });
       }
     }
   };

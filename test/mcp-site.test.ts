@@ -218,6 +218,32 @@ describe('fetchFeedback', () => {
     expect(items).toEqual([]);
     expect(manifest).toBeNull();
   });
+
+  it('parses view references into views and deep links, in order', async () => {
+    const { reader } = harness({
+      'GET /projects/towel-clip.json': json(MANIFEST),
+      'GET /comments/towel-clip/3.json': json({
+        comments: [
+          {
+            name: 'Sam',
+            text: 'thin here @view(az=-35,el=22,zoom=1.6) and here @view(az=90,el=0,zoom=2,parts=10), not @view(az=1)',
+            at: '2026-08-21T09:00:00.000Z',
+          },
+          { name: 'Jo', text: 'no references', at: '2026-08-22T09:00:00.000Z' },
+        ],
+      }),
+    });
+    const { items } = await fetchFeedback(reader, 'towel-clip', 3);
+    const [plain, pointed] = items;
+    expect(plain.views).toEqual([]);
+    expect(plain.viewUrls).toEqual([]);
+    expect(pointed.views).toHaveLength(2);
+    expect(pointed.views[1]).toMatchObject({ az: 90, el: 0, zoom: 2, parts: '10' });
+    expect(pointed.viewUrls).toEqual([
+      'https://3d.example/towel-clip/3#view(az=-35,el=22,zoom=1.6)',
+      'https://3d.example/towel-clip/3#view(az=90,el=0,zoom=2,parts=10)',
+    ]);
+  });
 });
 
 describe('verifyRevision', () => {

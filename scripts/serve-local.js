@@ -57,7 +57,7 @@ const fixtures = {
           publishedAt,
           notes: 'First pass — plate is 30 mm square.',
           bytes: fs.statSync(samplePath).size,
-          commentCount: 1,
+          commentCount: 2,
         },
         // Revision 2 records one, including the dirty case, which is the interesting
         // rendering: a commit alone does not identify what was built.
@@ -89,6 +89,17 @@ const fixtures = {
     'sample/1': {
       comments: [
         { name: 'Brian', text: 'Arm feels short — can it be taller?', at: publishedAt },
+        // View references, so the chips are visible locally: one camera-only, one
+        // that also turns the reference wall on, and a malformed one that must
+        // render as plain text.
+        {
+          name: 'Ana',
+          text:
+            'From underneath the arm looks thin @view(az=-35,el=-20,zoom=1.6) and against the wall ' +
+            'the gap is tight @view(az=90,el=10,zoom=1.2,parts=111).\n' +
+            'This one is broken and stays text: @view(az=1).',
+          at: new Date('2026-08-21T08:15:00Z').toISOString(),
+        },
       ],
     },
     'sample/2': { comments: [] },

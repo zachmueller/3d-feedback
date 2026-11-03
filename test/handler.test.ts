@@ -193,6 +193,12 @@ describe('sanitizeText', () => {
     expect(sanitizeText('   padded   ', 100)).toBe('padded');
     expect(sanitizeText('x'.repeat(50), 10)).toBe('x'.repeat(10));
   });
+  it('leaves view references intact, so a comment can point at a camera', () => {
+    // The viewer and the MCP server parse these out of the stored text; nothing
+    // server-side needs to know about them, as long as they survive cleaning.
+    const text = 'see @view(az=-35,el=22,zoom=1.6,roll=-5,pan=1.5,0,-2,parts=0110) here';
+    expect(sanitizeText(text, 4000)).toBe(text);
+  });
 });
 
 describe('optionalText', () => {
