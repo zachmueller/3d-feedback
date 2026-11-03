@@ -25,7 +25,8 @@ type Result = {
 const cleanUrl = load('clean-url.js');
 const adminRewrite = load('admin-rewrite.js');
 
-const req = (uri: string) => cleanUrl({ request: { uri, querystring: {} } });
+const req = (uri: string, querystring: Record<string, { value: string }> = {}) =>
+  cleanUrl({ request: { uri, querystring } });
 const VIEWER = '/viewer/index.html';
 
 describe('clean-url viewer-request function', () => {
@@ -40,20 +41,48 @@ describe('clean-url viewer-request function', () => {
     // which is why the rewrite is internal: the address bar keeps the URL that
     // was actually shared.
     it.each([
-      ['/towel-clip', 'project only'],
       ['/towel-clip/', 'project with a trailing slash'],
       ['/towel-clip/3', 'project and revision'],
       ['/towel-clip/3/', 'revision with a trailing slash'],
-      ['/a', 'single-character slug'],
+      ['/a/', 'single-character slug'],
       ['/towel-clip/1234567', 'many-digit revision'],
     ])('%s (%s)', (uri) => {
       expect(req(uri).uri).toBe(VIEWER);
+    });
+
+    // A screenshot link carries ?bare=1. The query is not rebuilt into a
+    // redirect, so the bare slug is served in place and still means "latest".
+    it('serves a bare slug with a query in place rather than redirecting', () => {
+      const res = req('/towel-clip', { bare: { value: '1' } });
+      expect(res.statusCode).toBeUndefined();
+      expect(res.uri).toBe(VIEWER);
     });
 
     it('lowercases a slug that picked up capitalization', () => {
       // Rewritten to the viewer, and the viewer lowercases again from the path;
       // what matters here is that no redirect or 404 happens.
       expect(req('/Towel-Clip/3').uri).toBe(VIEWER);
+    });
+  });
+
+  describe('a bare slug redirects to its trailing-slash form', () => {
+    // One canonical "latest" URL. The browser carries any #view(...) fragment
+    // across the redirect by itself.
+    it.each([
+      ['/towel-clip', '/towel-clip/'],
+      ['/a', '/a/'],
+      ['/Towel-Clip', '/towel-clip/'],
+    ])('%s -> %s', (uri, location) => {
+      const res = req(uri);
+      expect(res.statusCode).toBe(302);
+      expect(res.headers!.location.value).toBe(location);
+    });
+
+    it('leaves a revision URL without a trailing slash alone', () => {
+      // These are what the viewer copies and the publish tools print.
+      const res = req('/towel-clip/3');
+      expect(res.statusCode).toBeUndefined();
+      expect(res.uri).toBe(VIEWER);
     });
   });
 

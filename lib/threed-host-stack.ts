@@ -34,7 +34,8 @@ const NODE_RUNTIME = new lambda.Runtime('nodejs26.x', lambda.RuntimeFamily.NODEJ
  *
  * Share URLs are project + revision, not one-off UIDs:
  *
- *   /<project>          -> viewer, redirected client-side to the latest revision
+ *   /<project>          -> 302 to /<project>/ (one canonical "latest" URL)
+ *   /<project>/         -> viewer, redirected client-side to the latest revision
  *   /<project>/<rev>    -> viewer for that revision
  *
  * One viewer SPA under `viewer/` serves every project/revision; a CloudFront
@@ -481,10 +482,26 @@ export class ThreedHostStack extends Stack {
     // =========================================================================
     // prune is off so a deployment never touches runtime content (models,
     // manifests, comments) that lives in the same bucket.
+    //
+    // Every app file goes out with max-age=0. Without any Cache-Control a browser
+    // picks its own freshness from Last-Modified, and it keys that cache on the
+    // address-bar URL: each /<project>/<rev> a reviewer has opened keeps its own
+    // copy of the viewer HTML, while /viewer/viewer.js is one shared entry. After
+    // a deploy, an old revision URL could pair stale HTML with new script and
+    // fail on an element the old page did not have. Revalidating is an ETag
+    // round trip, usually a 304. s-maxage keeps the edge's 60 s, the same as
+    // the short cache policy's default.
+    const appCacheControl = [
+      s3deploy.CacheControl.setPublic(),
+      s3deploy.CacheControl.maxAge(Duration.seconds(0)),
+      s3deploy.CacheControl.mustRevalidate(),
+      s3deploy.CacheControl.sMaxAge(Duration.seconds(60)),
+    ];
     new s3deploy.BucketDeployment(this, 'DeployAdminApp', {
       destinationBucket: assetsBucket,
       destinationKeyPrefix: 'app',
       prune: false,
+      cacheControl: appCacheControl,
       sources: [
         s3deploy.Source.asset(path.join(__dirname, '..', 'admin-app')),
         s3deploy.Source.jsonData('config.json', {
@@ -504,6 +521,7 @@ export class ThreedHostStack extends Stack {
       destinationBucket: assetsBucket,
       destinationKeyPrefix: 'viewer',
       prune: false,
+      cacheControl: appCacheControl,
       sources: [
         s3deploy.Source.asset(path.join(__dirname, '..', 'viewer-app')),
         s3deploy.Source.jsonData('config.json', { apiUrl, siteUrl }),

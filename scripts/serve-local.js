@@ -207,7 +207,11 @@ const server = http.createServer(async (req, res) => {
   // Everything else goes through the real edge functions.
   const isAppPath = ['/login', '/admin', '/browse'].includes(uri.replace(/\/$/, ''));
   const fn = isAppPath ? adminRewrite : cleanUrl;
-  const request = { uri, querystring: {} };
+  // Only whether there is a query matters to the functions (clean-url serves a
+  // bare slug with one instead of redirecting it), so values stay as received.
+  const querystring = {};
+  for (const [key, value] of url.searchParams) querystring[key] = { value };
+  const request = { uri, querystring };
   const result = fn({ request });
 
   if (result.statusCode) {

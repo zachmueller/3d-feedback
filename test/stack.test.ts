@@ -7,6 +7,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { ThreedHostStack } from '../lib/threed-host-stack';
+import { RESERVED_SLUGS } from '../lib/lambda/handler';
 
 const ENV = { account: '123456789012', region: 'us-east-1' };
 
@@ -116,6 +117,22 @@ describe('CloudFront caching', () => {
         '/browse',
       ]),
     );
+  });
+
+  // A project slug is the first path segment of its share URL, so a project
+  // named after a behavior's path would be unreachable. The handler refuses
+  // reserved slugs at publish time; this keeps that list in step with the
+  // behaviors, so adding a route without reserving its name fails here.
+  it('reserves every routed path segment as a project slug', () => {
+    const distribution = Object.values(
+      template.findResources('AWS::CloudFront::Distribution'),
+    )[0].Properties.DistributionConfig;
+    const segments = (distribution.CacheBehaviors ?? [])
+      .map((b: any) => b.PathPattern as string)
+      .filter((p: string) => p.startsWith('/'))
+      .map((p: string) => p.split('/')[1]);
+    expect(segments.length).toBeGreaterThan(0);
+    expect(RESERVED_SLUGS).toEqual(expect.arrayContaining(segments));
   });
 
   it('turns a missing object into the viewer 404 page', () => {
@@ -406,5 +423,18 @@ describe('app deployments', () => {
     }
     const prefixes = deployments.map((d) => d.Properties.DestinationBucketKeyPrefix);
     expect(prefixes).toEqual(expect.arrayContaining(['app', 'viewer']));
+  });
+
+  // Without a Cache-Control header, browsers guess a freshness lifetime per
+  // URL. A revision URL opened before a deploy then kept serving the old viewer
+  // HTML against the new viewer.js.
+  it('makes browsers revalidate every app file', () => {
+    for (const deployment of Object.values(
+      template.findResources('Custom::CDKBucketDeployment'),
+    )) {
+      const cacheControl: string = deployment.Properties.SystemMetadata['cache-control'];
+      expect(cacheControl).toContain('max-age=0');
+      expect(cacheControl).toContain('must-revalidate');
+    }
   });
 });

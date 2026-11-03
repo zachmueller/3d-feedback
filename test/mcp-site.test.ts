@@ -165,7 +165,7 @@ describe('projectReport', () => {
   it('turns the manifest into share URLs, marking the latest', () => {
     const report = projectReport(MANIFEST, 'https://3d.example');
     expect(report.latestUrl).toBe('https://3d.example/towel-clip/4');
-    expect(report.projectUrl).toBe('https://3d.example/towel-clip');
+    expect(report.projectUrl).toBe('https://3d.example/towel-clip/');
     expect(report.revisions.map((r) => [r.rev, r.url, r.isLatest])).toEqual([
       [1, 'https://3d.example/towel-clip/1', false],
       [3, 'https://3d.example/towel-clip/3', false],

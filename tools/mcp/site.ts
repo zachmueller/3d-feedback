@@ -190,7 +190,7 @@ export function projectReport(manifest: Manifest, siteUrl: string): ProjectRepor
     title: manifest.title,
     latest: manifest.latest,
     latestUrl: manifest.latest === null ? null : shareUrlFor(siteUrl, manifest.slug, manifest.latest),
-    projectUrl: `${siteUrl}/${manifest.slug}`,
+    projectUrl: `${siteUrl}/${manifest.slug}/`,
     revisions: manifest.revisions.map((r) => ({
       rev: r.rev,
       url: shareUrlFor(siteUrl, manifest.slug, r.rev),
