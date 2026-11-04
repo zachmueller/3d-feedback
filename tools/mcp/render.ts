@@ -140,13 +140,27 @@ export interface RenderResult {
   height: number;
   bytes: number;
   out: string | null;
+  /** Browser launches it took; more than 1 means Chrome quit on its own first. */
+  attempts: number;
   png: string; // base64
+}
+
+/** How a browser went away: an exit code, a signal, or neither when only the connection dropped. */
+export interface BrowserExit {
+  code: number | null;
+  signal: string | null;
 }
 
 /** The browser surface render_view uses, so tests can stand one in. */
 export interface BrowserLike {
   newPage(): Promise<PageLike>;
   close(): Promise<void>;
+  /**
+   * Settles once the browser is gone, whether it quit on its own or was closed.
+   * Never rejects. A desktop Chrome can quit by itself mid-render, and without
+   * this a wait on its detached page just polls until the timeout.
+   */
+  exited: Promise<BrowserExit>;
 }
 export interface PageLike {
   goto(url: string, opts: { waitUntil: 'load'; timeout: number }): Promise<unknown>;
@@ -162,25 +176,97 @@ export type Launcher = (opts: {
   timeoutMs: number;
 }) => Promise<BrowserLike>;
 
+/**
+ * chrome-headless-shell is the old headless Chrome as its own binary, and
+ * puppeteer drives it in its 'shell' mode rather than as `--headless=new`.
+ */
+export function isHeadlessShell(executablePath: string): boolean {
+  return path.basename(executablePath).replace(/\.exe$/i, '') === 'chrome-headless-shell';
+}
+
+/** How long a dropped connection waits for the process's exit code. */
+const EXIT_CODE_WAIT_MS = 1000;
+
 /** puppeteer-core, loaded on first use so the server starts without it. */
 export const puppeteerLauncher: Launcher = async ({ executablePath, args, width, height, timeoutMs }) => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const puppeteer = require('puppeteer-core') as typeof import('puppeteer-core');
   const browser = await puppeteer.launch({
     executablePath,
-    headless: true,
+    headless: isHeadlessShell(executablePath) ? 'shell' : true,
     args,
     defaultViewport: { width, height, deviceScaleFactor: 1 },
     timeout: timeoutMs,
   });
-  return browser as unknown as BrowserLike;
+  const proc = browser.process();
+  const exited = new Promise<BrowserExit>((resolve) => {
+    const report = () => resolve({ code: proc?.exitCode ?? null, signal: proc?.signalCode ?? null });
+    proc?.once('exit', report);
+    // The connection usually drops a moment before the process is reaped; give
+    // the exit code a chance to arrive so the error can say what it was.
+    browser.once('disconnected', () => {
+      if (!proc || proc.exitCode !== null || proc.signalCode !== null) return report();
+      setTimeout(report, EXIT_CODE_WAIT_MS).unref();
+    });
+  });
+  return {
+    newPage: async () => (await browser.newPage()) as unknown as PageLike,
+    close: () => browser.close(),
+    exited,
+  };
 };
+
+/** Chrome went away during an attempt; the only failure render_view retries. */
+class BrowserDied extends Error {
+  constructor(
+    readonly exit: BrowserExit,
+    /** Seconds from starting to load the page, or null if it died before that. */
+    readonly afterOpen: number | null,
+  ) {
+    super('browser died');
+  }
+
+  describe(): string {
+    const how =
+      this.exit.code !== null
+        ? `exited (code ${this.exit.code})`
+        : this.exit.signal
+          ? `was killed (${this.exit.signal})`
+          : 'disconnected';
+    const when = this.afterOpen === null ? 'before the page opened' : `${this.afterOpen.toFixed(1)} s after opening the page`;
+    return `${how} ${when}`;
+  }
+}
+
+/** `p`'s value if it settles within `ms`, else null. */
+function within<T>(p: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms);
+    p.then((v) => {
+      clearTimeout(timer);
+      resolve(v);
+    });
+  });
+}
+
+export interface RenderTuning {
+  /** Browser launches before giving up on a Chrome that keeps quitting. */
+  attempts?: number;
+  /** After a page error, how long to wait to see whether the browser is going away. */
+  deathGraceMs?: number;
+}
+
+interface Shot {
+  png: string;
+  appliedView: string | null;
+}
 
 export async function renderView(
   cfg: Config,
   reader: SiteReader,
   args: RenderArgs,
   launch: Launcher = puppeteerLauncher,
+  { attempts = 3, deathGraceMs = 1500 }: RenderTuning = {},
 ): Promise<RenderResult> {
   const view = resolveViewInput(args.view);
   const { width, height } = clampSize(args.width, args.height);
@@ -198,66 +284,125 @@ export async function renderView(
     );
   }
 
-  if (!cfg.chromePath) {
+  const chromePath = cfg.chromePath;
+  if (!chromePath) {
     throw new RenderError(
       'No Chrome or Chromium was found to render with. Set THREED_CHROME_PATH (config key ' +
         'chromePath) to the browser binary; render_view drives it headlessly and downloads nothing.',
     );
   }
-  if (!fs.existsSync(cfg.chromePath)) {
-    throw new RenderError(`chromePath ${cfg.chromePath} does not exist. Fix THREED_CHROME_PATH (config key chromePath).`);
+  if (!fs.existsSync(chromePath)) {
+    throw new RenderError(`chromePath ${chromePath} does not exist. Fix THREED_CHROME_PATH (config key chromePath).`);
   }
 
   const timeoutMs = Math.round(cfg.renderTimeoutSeconds * 1000);
   const renderedUrl = renderUrl(reader.siteUrl, args.project, rev, view, bare);
-  const browser = await launch({ executablePath: cfg.chromePath, args: CHROME_ARGS, width, height, timeoutMs });
-  try {
-    const page = await browser.newPage();
-    await page.goto(renderedUrl, { waitUntil: 'load', timeout: timeoutMs });
-    try {
-      await page.waitForFunction(
-        () => ['ready', 'error'].includes(document.documentElement.dataset.viewerState ?? ''),
-        { polling: 100, timeout: timeoutMs },
-      );
-    } catch {
-      throw new RenderError(
-        `The viewer did not finish loading ${renderedUrl} within ${cfg.renderTimeoutSeconds}s ` +
-          '(THREED_RENDER_TIMEOUT_SECONDS). A large model may need longer; a viewer older than ' +
-          'render_view never reports ready at all.',
-      );
-    }
-    const state = await page.evaluate(() => ({
-      state: document.documentElement.dataset.viewerState ?? '',
-      view: document.documentElement.dataset.viewerView ?? null,
-      title: document.getElementById('errorTitle')?.textContent ?? '',
-      text: document.getElementById('errorText')?.textContent ?? '',
-    }));
-    if (state.state === 'error') {
-      throw new RenderError(`The viewer could not show ${renderedUrl}: ${state.title}. ${state.text}`.trim());
-    }
-    const canvas = await page.$('#canvas');
-    if (!canvas) throw new RenderError(`${renderedUrl} has no #canvas to capture.`);
-    const shot = await canvas.screenshot({ type: 'png', encoding: 'base64' });
-    const png = typeof shot === 'string' ? shot : Buffer.from(shot).toString('base64');
 
-    if (out) {
-      fs.mkdirSync(path.dirname(out), { recursive: true });
-      fs.writeFileSync(out, Buffer.from(png, 'base64'));
-    }
-    return {
-      project: args.project,
-      revision: rev,
-      url: renderUrl(reader.siteUrl, args.project, rev, view, false),
-      renderedUrl,
-      view,
-      appliedView: state.view,
-      width,
-      height,
-      bytes: Buffer.from(png, 'base64').length,
-      out,
-      png,
+  /**
+   * One launch, start to screenshot. Every step races the browser's exit, so a
+   * Chrome that quits ends the attempt at once; an error that arrives just
+   * before the exit does ("frame got detached", "Target closed") is given a
+   * moment to turn out to be one.
+   */
+  const renderOnce = async (): Promise<Shot> => {
+    const browser = await launch({ executablePath: chromePath, args: CHROME_ARGS, width, height, timeoutMs });
+    let opened: number | null = null;
+    const died = (exit: BrowserExit) =>
+      new BrowserDied(exit, opened === null ? null : (Date.now() - opened) / 1000);
+    const death = browser.exited.then((exit) => {
+      throw died(exit);
+    });
+    death.catch(() => undefined);
+    const alive = <T>(step: Promise<T>): Promise<T> => Promise.race([step, death]);
+    const diedSoon = async (): Promise<BrowserDied | null> => {
+      const exit = await within(browser.exited, deathGraceMs);
+      return exit ? died(exit) : null;
     };
-  } finally {
-    await browser.close().catch(() => undefined);
+
+    try {
+      const page = await alive(browser.newPage());
+      opened = Date.now();
+      await alive(page.goto(renderedUrl, { waitUntil: 'load', timeout: timeoutMs }));
+      try {
+        await alive(
+          page.waitForFunction(
+            () => ['ready', 'error'].includes(document.documentElement.dataset.viewerState ?? ''),
+            { polling: 100, timeout: timeoutMs },
+          ),
+        );
+      } catch (err) {
+        if (err instanceof BrowserDied) throw err;
+        const dead = await diedSoon();
+        if (dead) throw dead;
+        throw new RenderError(
+          `The viewer did not finish loading ${renderedUrl} within ${cfg.renderTimeoutSeconds}s ` +
+            '(THREED_RENDER_TIMEOUT_SECONDS), and Chrome is still running. A large model may need ' +
+            'longer; a viewer older than render_view never reports ready at all.',
+        );
+      }
+      const state = await alive(
+        page.evaluate(() => ({
+          state: document.documentElement.dataset.viewerState ?? '',
+          view: document.documentElement.dataset.viewerView ?? null,
+          title: document.getElementById('errorTitle')?.textContent ?? '',
+          text: document.getElementById('errorText')?.textContent ?? '',
+        })),
+      );
+      if (state.state === 'error') {
+        throw new RenderError(`The viewer could not show ${renderedUrl}: ${state.title}. ${state.text}`.trim());
+      }
+      const canvas = await alive(page.$('#canvas'));
+      if (!canvas) throw new RenderError(`${renderedUrl} has no #canvas to capture.`);
+      const shot = await alive(canvas.screenshot({ type: 'png', encoding: 'base64' }));
+      return { png: typeof shot === 'string' ? shot : Buffer.from(shot).toString('base64'), appliedView: state.view };
+    } catch (err) {
+      // A RenderError is the viewer's own answer from a live browser: not retried.
+      if (err instanceof BrowserDied || err instanceof RenderError) throw err;
+      throw (await diedSoon()) ?? err;
+    } finally {
+      await browser.close().catch(() => undefined);
+    }
+  };
+
+  const deaths: BrowserDied[] = [];
+  let shot: Shot | null = null;
+  while (!shot && deaths.length < Math.max(1, attempts)) {
+    try {
+      shot = await renderOnce();
+    } catch (err) {
+      if (!(err instanceof BrowserDied)) throw err;
+      deaths.push(err);
+    }
   }
+  if (!shot) {
+    const n = deaths.length;
+    throw new RenderError(
+      `Chrome quit on its own ${n === 1 ? 'on the only attempt' : `on all ${n} attempts`} to render ` +
+        `${renderedUrl} (${deaths.map((d) => d.describe()).join('; ')}). That is the browser at ` +
+        `${chromePath}, not the model. A managed or desktop Chrome can do this even headless. ` +
+        'Point THREED_CHROME_PATH at a chrome-headless-shell instead: ' +
+        '`npx @puppeteer/browsers install chrome-headless-shell@stable --path ~/.cache/puppeteer` ' +
+        'prints its path.',
+    );
+  }
+
+  const { png, appliedView } = shot;
+  if (out) {
+    fs.mkdirSync(path.dirname(out), { recursive: true });
+    fs.writeFileSync(out, Buffer.from(png, 'base64'));
+  }
+  return {
+    project: args.project,
+    revision: rev,
+    url: renderUrl(reader.siteUrl, args.project, rev, view, false),
+    renderedUrl,
+    view,
+    appliedView,
+    width,
+    height,
+    bytes: Buffer.from(png, 'base64').length,
+    out,
+    attempts: deaths.length + 1,
+    png,
+  };
 }

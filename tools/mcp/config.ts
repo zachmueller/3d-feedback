@@ -247,9 +247,14 @@ export function findFreecadcmd(env: Record<string, string | undefined>): string 
 }
 
 /**
- * A Chrome or Chromium for render_view: PATH first (the Linux names), then the
- * usual install locations. Nothing is downloaded — puppeteer-core drives whatever
+ * A Chrome or Chromium for render_view: a chrome-headless-shell from puppeteer's
+ * browser cache if one was installed, then PATH (the Linux names), then the usual
+ * install locations. Nothing is downloaded — puppeteer-core drives whatever
  * browser is already there, which keeps a ~170 MB Chromium out of `npm install`.
+ *
+ * The headless shell comes first because it is not the desktop browser: a
+ * managed desktop Chrome was seen quitting on its own mid-render about one
+ * launch in three, where the shell, on the same machine, did not.
  */
 const CHROME_NAMES = ['google-chrome', 'google-chrome-stable', 'chromium', 'chromium-browser'];
 const chromeLocations = (): string[] => [
@@ -263,10 +268,67 @@ const chromeLocations = (): string[] => [
   '/snap/bin/chromium',
 ];
 
+/** puppeteer's name for this platform in its cache's `<platform>-<version>` directories. */
+function puppeteerPlatform(): string | null {
+  if (process.platform === 'darwin') return process.arch === 'arm64' ? 'mac_arm' : 'mac';
+  if (process.platform === 'linux') return 'linux';
+  if (process.platform === 'win32') return 'win64';
+  return null;
+}
+
+function compareVersions(a: string, b: string): number {
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+/**
+ * The newest chrome-headless-shell in puppeteer's browser cache, as
+ * `npx @puppeteer/browsers install chrome-headless-shell@stable --path ~/.cache/puppeteer`
+ * (or a full `puppeteer` install) lays it out:
+ * `<cache>/chrome-headless-shell/<platform>-<version>/chrome-headless-shell-<arch>/chrome-headless-shell`.
+ */
+export function findHeadlessShell(
+  env: Record<string, string | undefined>,
+  exists: (file: string) => boolean = fs.existsSync,
+): string | null {
+  const platform = puppeteerPlatform();
+  if (!platform) return null;
+  const cache = env.PUPPETEER_CACHE_DIR || path.join(env.HOME || os.homedir(), '.cache', 'puppeteer');
+  const root = path.join(cache, 'chrome-headless-shell');
+  const list = (dir: string): string[] => {
+    try {
+      return fs.readdirSync(dir);
+    } catch {
+      return [];
+    }
+  };
+  const prefix = `${platform}-`;
+  const versions = list(root)
+    .filter((name) => name.startsWith(prefix))
+    .map((name) => name.slice(prefix.length))
+    .sort((a, b) => compareVersions(b, a));
+  const binary = platform === 'win64' ? 'chrome-headless-shell.exe' : 'chrome-headless-shell';
+  for (const version of versions) {
+    const dir = path.join(root, prefix + version);
+    for (const sub of list(dir).filter((name) => name.startsWith('chrome-headless-shell-'))) {
+      const file = path.join(dir, sub, binary);
+      if (exists(file)) return file;
+    }
+  }
+  return null;
+}
+
 export function findChrome(
   env: Record<string, string | undefined>,
   exists: (file: string) => boolean = fs.existsSync,
 ): string | null {
+  const shell = findHeadlessShell(env, exists);
+  if (shell) return shell;
   for (const name of CHROME_NAMES) {
     const found = whichBinary(name, env);
     if (found) return found;

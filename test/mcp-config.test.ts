@@ -15,6 +15,7 @@ import {
   activeTools,
   ConfigError,
   findChrome,
+  findHeadlessShell,
   isInside,
   loadConfig,
   PathError,
@@ -98,9 +99,39 @@ describe('render_view settings', () => {
     const bin = path.join(dir, 'bin');
     fs.mkdirSync(bin);
     fs.writeFileSync(path.join(bin, 'chromium'), '', { mode: 0o755 });
-    expect(findChrome({ PATH: bin }, () => false)).toBe(path.join(bin, 'chromium'));
-    expect(findChrome({ PATH: '' }, (f) => f === '/usr/bin/chromium')).toBe('/usr/bin/chromium');
-    expect(findChrome({ PATH: '' }, () => false)).toBeNull();
+    const empty = { PUPPETEER_CACHE_DIR: path.join(dir, 'no-cache') }; // not this machine's real cache
+    expect(findChrome({ ...empty, PATH: bin }, () => false)).toBe(path.join(bin, 'chromium'));
+    expect(findChrome({ ...empty, PATH: '' }, (f) => f === '/usr/bin/chromium')).toBe('/usr/bin/chromium');
+    expect(findChrome({ ...empty, PATH: '' }, () => false)).toBeNull();
+  });
+
+  it('prefers the newest chrome-headless-shell in puppeteer\'s cache over any desktop browser', () => {
+    const platform =
+      process.platform === 'darwin' ? (process.arch === 'arm64' ? 'mac_arm' : 'mac')
+        : process.platform === 'win32' ? 'win64' : 'linux';
+    const binary = platform === 'win64' ? 'chrome-headless-shell.exe' : 'chrome-headless-shell';
+    const cache = path.join(dir, 'cache');
+    const shell = (version: string) => {
+      const sub = path.join(cache, 'chrome-headless-shell', `${platform}-${version}`, 'chrome-headless-shell-x');
+      fs.mkdirSync(sub, { recursive: true });
+      fs.writeFileSync(path.join(sub, binary), '');
+      return path.join(sub, binary);
+    };
+    shell('9.0.1.2');
+    const newest = shell('148.0.7778.97');
+    shell('10.0.0.0');
+    fs.mkdirSync(path.join(cache, 'chrome-headless-shell', 'other_os-999.0.0.0', 'chrome-headless-shell-x'), { recursive: true });
+
+    const bin = path.join(dir, 'bin');
+    fs.mkdirSync(bin);
+    fs.writeFileSync(path.join(bin, 'chromium'), '', { mode: 0o755 });
+    expect(findChrome({ PUPPETEER_CACHE_DIR: cache, PATH: bin })).toBe(newest);
+    expect(findHeadlessShell({ PUPPETEER_CACHE_DIR: cache })).toBe(newest);
+    // Gone from disk, or never installed: the desktop browser, as before.
+    expect(findChrome({ PUPPETEER_CACHE_DIR: cache, PATH: bin }, (f) => f !== newest && !f.includes('chrome-headless-shell'))).toBe(
+      path.join(bin, 'chromium'),
+    );
+    expect(findHeadlessShell({ PUPPETEER_CACHE_DIR: path.join(dir, 'nothing') })).toBeNull();
   });
 });
 

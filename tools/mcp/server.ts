@@ -249,6 +249,9 @@ function renderSummary(result: RenderResult): string[] {
     `Rendered ${result.project} revision ${result.revision} at ${describeView(result.view)}, ` +
       `${result.width}×${result.height}.`,
     `A person opens the same view at ${result.url}`,
+    ...(result.attempts > 1
+      ? [`Chrome quit on its own ${result.attempts - 1} time(s) first; rendered on launch ${result.attempts}.`]
+      : []),
     ...(result.out ? [`Saved to ${result.out}`] : []),
   ];
 }

@@ -18,6 +18,7 @@ import { promisify } from 'util';
 import { callerIdentity, CredentialError, credentialFix, whoIsSigning } from './aws';
 import { type ConfigSource, type Config, type LoadedConfig, type ToolName } from './config';
 import { errorDetail, nodeFetch, request } from './http';
+import { isHeadlessShell } from './render';
 
 const execFileAsync = promisify(execFile);
 
@@ -102,9 +103,20 @@ function probeFile(name: string, file: string, envVar: string): Probe {
  * `--version` starts the binary, and a check is not worth a browser launch.
  * Not-found is `null`, not a failure, because nothing else depends on it.
  */
+const INSTALL_HEADLESS_SHELL = 'npx @puppeteer/browsers install chrome-headless-shell@stable --path ~/.cache/puppeteer';
+
 function probeChrome(cfg: Config): Probe {
   if (cfg.chromePath && fs.existsSync(cfg.chromePath)) {
-    return { name: 'chrome', ok: true, detail: `${cfg.chromePath} (for render_view)` };
+    if (isHeadlessShell(cfg.chromePath)) {
+      return { name: 'chrome', ok: true, detail: `${cfg.chromePath} (chrome-headless-shell, for render_view)` };
+    }
+    return {
+      name: 'chrome',
+      ok: true,
+      detail:
+        `${cfg.chromePath} (for render_view). A desktop or managed Chrome can quit on its own ` +
+        `mid-render; \`${INSTALL_HEADLESS_SHELL}\` installs a headless shell render_view will prefer.`,
+    };
   }
   return {
     name: 'chrome',
@@ -112,7 +124,9 @@ function probeChrome(cfg: Config): Probe {
     detail: cfg.chromePath
       ? `${cfg.chromePath} is missing`
       : 'no Chrome or Chromium found — render_view will refuse to run',
-    fix: 'Set THREED_CHROME_PATH (config key chromePath) to a Chrome or Chromium binary.',
+    fix:
+      'Set THREED_CHROME_PATH (config key chromePath) to a Chrome or Chromium binary, or install ' +
+      `a chrome-headless-shell, which is found automatically: ${INSTALL_HEADLESS_SHELL}`,
   };
 }
 
